@@ -9,6 +9,7 @@
 
 import time
 from collections import Counter
+import gc, os
 import math
 import torch
 import torch.nn as nn
@@ -167,6 +168,95 @@ def bench_dpcs_ckpt(batch=BATCH, seq=SEQ_LEN):
     return avg_ms, ips, max_peak, last_loss, dict(modes)
 
 # --- Binary search: maximum tokens that fit (tokens = batch * seq) ---
+def _safe_cuda_cleanup():
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()  # flush async errors first
+        except Exception:
+            pass
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()  # release cached blocks (won't increase allocatable memory)
+        except Exception:
+            # If a prior async error is bubbling here, just ignore and move on
+            pass
+    gc.collect()
+
+def _is_oom(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", RuntimeError))
+        or "out of memory" in msg
+        or "cuda error: out of memory" in msg
+    )
+
+def fits(tokens, use_dpcs_ckpt):
+    """Try one fwd+bwd step with total tokens, return True if it fits (no OOM)."""
+    batch = BATCH
+    seq = max(tokens // batch, 1)
+
+    _safe_cuda_cleanup()
+
+    model = TinyTransformer().to(DEVICE)
+    dpcs = None
+    if use_dpcs_ckpt:
+        dpcs = DPCS(device_type=DEVICE, signals_freq_steps=SIGNAL_EVERY)
+        model = dpcs.wrap(model, allow_fp8=(DEVICE=="cuda"))
+        dpcs._ckpt_policy = CheckpointPolicy.MUST_RECOMPUTE
+
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cuda") if DEVICE == "cuda" else None
+
+    try:
+        x = rand_batch(batch, seq)
+        opt.zero_grad(set_to_none=True)
+
+        if dpcs:
+            dpcs.start_step()
+            fwd_ctx, _ = dpcs.checkpoint_contexts()
+            with fwd_ctx:
+                with torch.autocast(device_type=DEVICE, dtype=torch.float16, enabled=(DEVICE=="cuda")):
+                    y = model(x); loss = (y ** 2).mean()
+        else:
+            with torch.autocast(device_type=DEVICE, dtype=torch.float16, enabled=(DEVICE=="cuda")):
+                y = model(x); loss = (y ** 2).mean()
+
+        scaler.scale(loss).backward() if scaler else loss.backward()
+        if dpcs: dpcs.collect_signals(loss, model)
+        (scaler.step(opt), scaler.update()) if scaler else opt.step()
+        if dpcs: dpcs.end_step(opt, scaler)
+        return True
+
+    except Exception as e:
+        if _is_oom(e):
+            return False
+        raise
+
+    finally:
+        # Drop references and clean up aggressively between probes
+        del model, opt
+        if dpcs is not None: del dpcs
+        for name in ("x", "y", "loss"):
+            if name in locals(): del locals()[name]
+        _safe_cuda_cleanup()
+
+def max_tokens(lo=BATCH*128, hi=BATCH*8192, use_dpcs_ckpt=False):
+    if DEVICE != "cuda":
+        return None
+    l, r = lo, hi
+    while l < r:
+        mid = (l + r + 1) // 2
+        ok = fits(mid, use_dpcs_ckpt)
+        print(f"[search {'DPCS' if use_dpcs_ckpt else 'BASE'}] try tokens={mid:,} -> {ok}")
+        if ok: l = mid
+        else:  r = mid - 1
+    return l
+
+
+'''
 def fits(tokens, use_dpcs_ckpt):
     """Try one forward+backward step with total tokens, return True if it fits."""
     batch = BATCH
@@ -202,17 +292,7 @@ def fits(tokens, use_dpcs_ckpt):
     except RuntimeError as e:
         if "CUDA out of memory" in str(e): return False
         raise
-
-def max_tokens(lo= BATCH*128, hi=BATCH*8192, use_dpcs_ckpt=False):
-    """Binary search the largest token count that fits (on CUDA)."""
-    if DEVICE != "cuda":
-        return None
-    l, r = lo, hi
-    while l < r:
-        mid = (l + r + 1) // 2
-        if fits(mid, use_dpcs_ckpt): l = mid
-        else: r = mid - 1
-    return l
+        '''
 
 def main():
     print(f"Device: {DEVICE}, CUDA available: {torch.cuda.is_available()}")
