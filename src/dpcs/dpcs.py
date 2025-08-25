@@ -1,375 +1,196 @@
-# Dynamic Precision + Checkpointing Scheduler (DPCS)
-# PyTorch is the only hard dependency.
-# Optional: NVIDIA Transformer Engine (TE) for FP8 if installed.
-
+# src/dpcs/dpcs.py
 from __future__ import annotations
-import contextlib
-import functools
-import math
-import types
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, Iterable, Callable
+from typing import Optional, Tuple, Dict, Any, Callable
+from contextlib import nullcontext
+from collections import Counter
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
 
+def summary(self):
+    modes = Counter(getattr(st, "mode", "fp16") for st in self._registry.values())
+    return {"step": self._step, "modes": dict(modes),
+            "ckpt_on": self.is_checkpointing(),
+            "headroom": round(self.last_headroom(), 3)}
 
-# -------------------------------
-# Optional backends
-# -------------------------------
+# Selective activation checkpointing (policy-based)
 try:
-    import transformer_engine.pytorch as te  # type: ignore
-    from transformer_engine.common.recipe import DelayedScaling, Format  # type: ignore
-    _TE_AVAILABLE = True
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
 except Exception:
-    te = None
-    DelayedScaling = None
-    Format = None
-    _TE_AVAILABLE = False
+    create_selective_checkpoint_contexts = None
+    class CheckpointPolicy:
+        MUST_RECOMPUTE = object()
 
+@dataclass
+class _ModuleState:
+    name: str
+    orig_forward: Callable
+    mode: str = "fp16"                 # 'fp32' | 'fp16' | 'fp8'
+    grad_var_ema: float = 0.0
+    curvature_proxy_ema: float = 0.0
+    grad_norm_sq_prev: float = 0.0
 
-# -------------------------------
-# Utilities
-# -------------------------------
-
-def _leaf_modules(model):
+def _leaf_modules(model: nn.Module):
     for name, m in model.named_modules():
         if len(list(m.children())) == 0 and any(p.requires_grad for p in m.parameters(recurse=False)):
             yield name, m
 
-
-def _flatten_grad_norm_sq(module: nn.Module) -> float:
-    """Sum of squared gradient elements across all params of a module (current step)."""
-    total = 0.0
-    for p in module.parameters(recurse=False):
-        if p.grad is not None:
-            g = p.grad.detach()
-            total += float(g.pow(2).sum().item())
-    return total
-
-
-def _flatten_grad_var(module: nn.Module) -> float:
-    """Cheap proxy: variance of gradients across params/elements for this step."""
-    # NOTE: This is not per-sample variance; it’s an inexpensive per-parameter-element variance proxy.
-    vals = []
-    for p in module.parameters(recurse=False):
-        if p.grad is not None:
-            g = p.grad.detach().float().view(-1)
-            if g.numel() > 0:
-                vals.append(g.var(unbiased=False).item())
-    if not vals:
-        return 0.0
-    return float(sum(vals) / len(vals))
-
-
-# -------------------------------
-# Memory monitor
-# -------------------------------
-
 @dataclass
-class MemoryStats:
-    free_bytes: int
-    total_bytes: int
-    peak_alloc_bytes: int
+class DPCS:
+    # policy knobs
+    epsilon_g: float = 1e-3            # grad-variance threshold εg
+    kappa: float = 5.0                 # curvature threshold κ
+    device_type: str = "cuda"
+    signals_freq_steps: int = 200
+    fp8_backend: Optional[str] = None  # "te" enables Transformer Engine if available
 
-    @property
-    def headroom_bytes(self) -> int:
-        return max(self.free_bytes, 0)
+    # adaptive checkpointing hysteresis
+    ckpt_low: float = 0.12             # turn ON if free/total < 12%
+    ckpt_high: float = 0.20            # turn OFF when free/total > 20%
+    ckpt_need: int = 2                 # need N consecutive low-headroom steps
 
-    @property
-    def headroom_ratio(self) -> float:
-        return self.headroom_bytes / max(self.total_bytes, 1)
+    # runtime state
+    _step: int = field(default=0, init=False)
+    _registry: Dict[str, _ModuleState] = field(default_factory=dict, init=False)
+    _ckpt_on: bool = field(default=False, init=False)
+    _ckpt_below: int = field(default=0, init=False)
+    _last_headroom: float = field(default=1.0, init=False)
+    _ckpt_policy: Any = field(default=None, init=False)
+    _te: Any = field(default=None, init=False)      # Transformer Engine handle (optional)
+    _allow_fp8: bool = field(default=False, init=False)
+    _prev_scale: Optional[float] = field(default=None, init=False)  # for overflow detection
 
+    def __post_init__(self) -> None:
+        # Optional FP8 backend discovery (Transformer Engine)
+        if self.fp8_backend == "te":
+            try:
+                import transformer_engine.pytorch as te
+                self._te = te
+            except Exception:
+                self._te = None
+        self._ckpt_policy = getattr(CheckpointPolicy, "MUST_RECOMPUTE", CheckpointPolicy.MUST_RECOMPUTE)
 
-class MemoryMonitor:
-    def __init__(self, device: torch.device | int | None = None):
-        self.device = device
+    # ------------ public API ------------
+    def wrap(self, model: nn.Module, allow_fp8: bool = False) -> nn.Module:
+        """Install per-leaf forward shims so DPCS can enforce per-layer precision at runtime."""
+        self._allow_fp8 = bool(allow_fp8 and (self._te is not None))
+        for name, m in _leaf_modules(model):
+            if hasattr(m, "_dpcs_state"):
+                continue
+            st = _ModuleState(name=name, orig_forward=m.forward)
+            self._registry[name] = st
+            m._dpcs_state = st  # attach
+            m.forward = self._make_precision_shim(m, st)  # type: ignore[assignment]
+        return model
 
     def start_step(self) -> None:
-        # Reset peak stats at the beginning of each step.
-        try:
-            torch.cuda.memory.reset_peak_memory_stats(self.device)
-        except Exception:
-            # Fallback for older builds
+        self._step += 1
+
+    def collect_signals(self, loss: torch.Tensor, model: nn.Module) -> None:
+        """Update per-module signals. Heavy stats can be computed sparsely."""
+        heavy = (self._step % self.signals_freq_steps == 0)
+        for name, m in _leaf_modules(model):
+            st = self._registry[name]
+            # curvature proxy ~ change in grad L2^2
+            gn2 = 0.0
+            for p in m.parameters(recurse=False):
+                if p.grad is not None:
+                    gn2 += float(p.grad.detach().pow(2).sum().item())
+            rel = abs(gn2 - st.grad_norm_sq_prev) / (st.grad_norm_sq_prev + 1e-12) if st.grad_norm_sq_prev > 0 else 0.0
+            st.curvature_proxy_ema = 0.9 * st.curvature_proxy_ema + 0.1 * rel
+            st.grad_norm_sq_prev = gn2
+
+            if heavy:
+                grads = []
+                for p in m.parameters(recurse=False):
+                    if p.grad is not None:
+                        grads.append(p.grad.detach().float().reshape(-1))
+                if grads:
+                    g = torch.cat(grads)
+                    var_now = float(g.var(unbiased=False).item())
+                    st.grad_var_ema = 0.9 * st.grad_var_ema + 0.1 * var_now
+
+    def end_step(self, optimizer: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None) -> None:
+        """Call once per iteration after optimizer/scaler.step()."""
+        # 1) update adaptive checkpointing gate from memory headroom
+        self._update_ckpt_gate()
+
+        # 2) detect overflow via GradScaler scale drop
+        overflow = False
+        if scaler is not None:
             try:
-                torch.cuda.reset_peak_memory_stats(self.device)  # deprecated alias
+                cur = float(scaler.get_scale())
+                if self._prev_scale is not None and cur < self._prev_scale:
+                    overflow = True
+                self._prev_scale = cur
             except Exception:
                 pass
 
-    def end_step(self) -> MemoryStats:
-        # Global free / total from cudaMemGetInfo
-        try:
-            free_b, total_b = torch.cuda.memory.mem_get_info(self.device)
-        except Exception:
-            # Last-ditch fallback if the memory API is unavailable
-            props = torch.cuda.get_device_properties(self.device or torch.cuda.current_device())
-            total_b = getattr(props, "total_memory", 0)
-            # We can't know "free", so we at least report reserved headroom
-            free_b = max(total_b - torch.cuda.memory_reserved(self.device), 0)
+        # 3) precision mode for *next* step
+        for st in self._registry.values():
+            if overflow:
+                st.mode = "fp32"
+                continue
+            lower_ok = (st.grad_var_ema < self.epsilon_g) or (st.curvature_proxy_ema > self.kappa)
+            if self._allow_fp8 and lower_ok:
+                st.mode = "fp8"
+            elif lower_ok:
+                st.mode = "fp16"
+            # else keep previous (sticky)
 
-        # Peak allocated bytes within the step
-        try:
-            peak_alloc = torch.cuda.memory.max_memory_allocated(self.device)
-        except Exception:
-            peak_alloc = torch.cuda.max_memory_allocated(self.device or torch.cuda.current_device())
+    def checkpoint_contexts_if_needed(self) -> Tuple[object, object]:
+        """Return (fwd_ctx, bwd_ctx). Null contexts if gate is off."""
+        if (not self._ckpt_on) or (create_selective_checkpoint_contexts is None) or (self._ckpt_policy is None):
+            return nullcontext(), nullcontext()
+        def _policy_fn(_ctx, _op, *a, **k):
+            return self._ckpt_policy
+        return create_selective_checkpoint_contexts(_policy_fn)
 
-        return MemoryStats(
-            free_bytes=int(free_b),
-            total_bytes=int(total_b),
-            peak_alloc_bytes=int(peak_alloc),
-        )
+    def is_checkpointing(self) -> bool:
+        return bool(self._ckpt_on)
 
+    def last_headroom(self) -> float:
+        return float(self._last_headroom)
 
-# -------------------------------
-# Precision modes
-# -------------------------------
+    def summary(self) -> Dict[str, Any]:
+        modes = Counter(getattr(st, "mode", "fp16") for st in self._registry.values())
+        return {"step": self._step, "modes": dict(modes), "ckpt_on": self.is_checkpointing(), "headroom": round(self.last_headroom(), 3)}
 
-class PrecisionMode:
-    FP32 = "fp32"
-    FP16 = "fp16"
-    FP8  = "fp8"
-
-
-# -------------------------------
-# Per-module state we track
-# -------------------------------
-
-@dataclass
-class ModuleSignals:
-    grad_norm_sq_prev: float = 0.0
-    grad_norm_sq_ema: float = 0.0
-    grad_var_ema: float = 0.0
-    curvature_proxy_ema: float = 0.0
-    mode: str = PrecisionMode.FP32
-    cooldown_steps: int = 0  # when overflow risk triggers fallback
-
-
-# -------------------------------
-# Precision wrapper (monkey-patch forward)
-# -------------------------------
-
-class _ForwardShim:
-    """
-    Monkey-patches a module's forward to run under the precision mode chosen by the scheduler.
-    Keeps the original forward in m._dpcs_orig_forward.
-    """
-
-    def __init__(self, module: nn.Module, name: str, registry: Dict[str, ModuleSignals],
-                 device_type: str = "cuda",
-                 te_recipe=None,
-                 allow_fp8: bool = False):
-        self.m = module
-        self.name = name
-        self.registry = registry
-        self.device_type = device_type
-        self.te_recipe = te_recipe
-        self.allow_fp8 = allow_fp8 and _TE_AVAILABLE
-
-        if not hasattr(self.m, "_dpcs_orig_forward"):
-            self.m._dpcs_orig_forward = self.m.forward  # type: ignore[attr-defined]
-            self.m.forward = types.MethodType(self._wrapped_forward, self.m)  # type: ignore[assignment]
-
-    def _wrapped_forward(self, module, *args, **kwargs):
-        state = self.registry[self.name]
-        mode = state.mode
-
-        # FP8 region (Transformer Engine) if available and allowed.
-        if mode == PrecisionMode.FP8 and self.allow_fp8 and te is not None:
-            with te.fp8_autocast(enabled=True, fp8_recipe=self.te_recipe):
-                return module._dpcs_orig_forward(*args, **kwargs)  # type: ignore[attr-defined]
-
-        # FP16 region via torch.amp.autocast
-        if mode == PrecisionMode.FP16:
-            with torch.amp.autocast(self.device_type, dtype=torch.float16):
-                return module._dpcs_orig_forward(*args, **kwargs)  # type: ignore[attr-defined]
-
-        # FP32: run without autocast
-        return module._dpcs_orig_forward(*args, **kwargs)  # type: ignore[attr-defined]
-
-
-# -------------------------------
-# Checkpoint policy controller
-# -------------------------------
-
-class CheckpointPolicyController:
-    def __init__(self, headroom_low: float = 0.15, headroom_high: float = 0.35):
-        """
-        headroom_* are fractions of total device memory. Below low → recompute more.
-        Above high → prefer save (less recompute).
-        """
-        self.headroom_low = headroom_low
-        self.headroom_high = headroom_high
-        self._last_policy: CheckpointPolicy = CheckpointPolicy.PREFER_SAVE
-
-    def choose_policy(self, mem: MemoryStats) -> CheckpointPolicy:
-        r = mem.headroom_ratio
-        if r < self.headroom_low:
-            self._last_policy = CheckpointPolicy.MUST_RECOMPUTE
-        elif r > self.headroom_high:
-            self._last_policy = CheckpointPolicy.PREFER_SAVE
-        # otherwise keep last policy to avoid flapping
-        return self._last_policy
-
-    def context_fn(self, policy: CheckpointPolicy):
-        def policy_fn(ctx, op, *args, **kwargs):
-            # Use a coarse knob: one policy for all ops this step.
-            return policy
-        return functools.partial(create_selective_checkpoint_contexts, policy_fn)
-
-    @contextlib.contextmanager
-    def contexts(self, mem: MemoryStats):
-        policy = self.choose_policy(mem)
-        fwd_ctx, bwd_ctx = self.context_fn(policy)()
-        with fwd_ctx:
-            with contextlib.ExitStack() as stack:
-                # Backward context is set by torch when recomputing.
-                yield
-
-
-# -------------------------------
-# The DPCS orchestrator
-# -------------------------------
-
-@dataclass
-class DPCS:
-    epsilon_g: float = 1e-3      # gradient variance threshold (lower → allow lower precision)
-    kappa: float = 5.0           # curvature threshold (higher → bump back to FP32)
-    ema_beta: float = 0.9        # smoothing for signal EMAs
-    cooldown_steps: int = 50     # steps to force FP32 after an overflow event
-    fp8_backend: Optional[str] = "te"
-    signals_freq_steps: int = 10 # compute "heavier" signals every N steps
-    device_type: str = "cuda"
-
-    # Runtime
-    _registry: Dict[str, ModuleSignals] = field(default_factory=dict, init=False)
-    _step: int = field(default=0, init=False)
-    _mem: MemoryMonitor = field(default_factory=MemoryMonitor, init=False)
-    _ckpt_ctrl: CheckpointPolicyController = field(default_factory=CheckpointPolicyController, init=False)
-    _te_recipe = None
-    _last_scale: Optional[float] = None
-    _overflow_recent: bool = False
-
-    def __post_init__(self):
-        if self.fp8_backend == "te" and _TE_AVAILABLE:
-            # Reasonable default: Hybrid FP8 (E4M3 fwd, E5M2 bwd) delayed scaling
-            self._te_recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max")
-
-    # ---- Public API ---------------------------------------------------------
-
-    def wrap(self, model: nn.Module, allow_fp8: bool = True) -> nn.Module:
-        """
-        Register leaf modules and monkey-patch forwards with precision shims.
-        If TE is enabled, FP8 regions only help if you’re using TE modules (e.g., te.Linear).
-        """
-        self._registry.clear()
-        for name, m in _leaf_modules(model):
-            self._registry[name] = ModuleSignals()
-            _ForwardShim(
-                m, name, self._registry,
-                device_type=self.device_type,
-                te_recipe=self._te_recipe,
-                allow_fp8=(allow_fp8 and self.fp8_backend == "te")
-            )
-        return model
-
-    def memory_monitor(self) -> MemoryMonitor:
-        return self._mem
-
-    @contextlib.contextmanager
-    def checkpoint_context(self):
-        # Choose based on last measured memory (updated in end_step),
-        # but we still create a valid context; we’ll re-evaluate after forward as needed.
-        # Here, we default to PREFER_SAVE until end_step computes true headroom.
-        fwd_ctx, _ = create_selective_checkpoint_contexts(lambda *_: CheckpointPolicy.PREFER_SAVE)
-        with fwd_ctx[0] if isinstance(fwd_ctx, tuple) else fwd_ctx:
-            yield
-
-    # ---- Step lifecycle -----------------------------------------------------
-
-    def start_step(self):
-        self._overflow_recent = False
-        self._mem.start_step()
-
-    def collect_signals(self, loss: torch.Tensor, model: nn.Module):
-        """Should be called after loss.backward(). Updates EMAs and cheap curvature proxy."""
-        heavy = (self._step % self.signals_freq_steps == 0)
-
-        for name, m in _leaf_modules(model):
-            st = self._registry[name]
-            # gradient energy & variance (cheap)
-            gn2 = _flatten_grad_norm_sq(m)
-            st.grad_norm_sq_ema = self.ema_beta * st.grad_norm_sq_ema + (1 - self.ema_beta) * gn2
-            if heavy:
-                var_now = _flatten_grad_var(m)
-                st.grad_var_ema = self.ema_beta * st.grad_var_ema + (1 - self.ema_beta) * var_now
-
-            # curvature proxy: relative change in grad energy
-            if st.grad_norm_sq_prev > 0.0:
-                rel = abs(gn2 - st.grad_norm_sq_prev) / (st.grad_norm_sq_prev + 1e-12)
+    # ------------ internals ------------
+    def _make_precision_shim(self, module: nn.Module, st: _ModuleState):
+        te = self._te
+        def _fwd(*args, **kwargs):
+            m = st.mode
+            if m == "fp32":
+                # force full precision locally (disable autocast)
+                with torch.autocast(self.device_type, enabled=False):
+                    return st.orig_forward(*args, **kwargs)
+            elif m == "fp8" and (te is not None):
+                # optional FP8 region (Transformer Engine)
+                with te.fp8_autocast(enabled=True):
+                    return st.orig_forward(*args, **kwargs)
             else:
-                rel = 0.0
-            st.curvature_proxy_ema = self.ema_beta * st.curvature_proxy_ema + (1 - self.ema_beta) * rel
-            st.grad_norm_sq_prev = gn2
+                # fp16 path relies on outer global autocast (AMP)
+                return st.orig_forward(*args, **kwargs)
+        return _fwd
 
-            # cooldown ticks down
-            if st.cooldown_steps > 0:
-                st.cooldown_steps -= 1
+    def _read_headroom(self) -> float:
+        if self.device_type == "cuda" and torch.cuda.is_available():
+            try:
+                free_b, total_b = torch.cuda.memory.mem_get_info()  # (free, total) bytes
+                return (float(free_b) / float(total_b)) if total_b else 1.0
+            except Exception:
+                pass
+        return getattr(self, "_last_headroom", 1.0)
 
-        # (Optional) Place to add heavier signals (e.g., Hutchinson HVP or BackPACK diag-GGN) when heavy==True
-
-    def end_step(self, optimizer: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None):
-        """Update precision and checkpoint policy for the *next* step."""
-        self._step += 1
-
-        # Overflow detection via GradScaler scale drops (public signal)
-        if scaler is not None:
-            current_scale = float(scaler.get_scale())
-            if self._last_scale is not None and current_scale < self._last_scale:
-                self._overflow_recent = True
-            self._last_scale = current_scale
-
-        # Memory stats
-        mem = self._mem.end_step()
-
-        # Decide checkpoint policy for next step (coarse knob)
-        self._ckpt_policy = self._ckpt_ctrl.choose_policy(mem)
-
-        # Per-module precision decisions
-        for name, st in self._registry.items():
-            # If overflow recently or on cooldown → FP32
-            if self._overflow_recent or st.cooldown_steps > 0:
-                st.mode = PrecisionMode.FP32
-                # Extend cooldown a bit if we actually overflowed
-                if self._overflow_recent:
-                    st.cooldown_steps = max(st.cooldown_steps, self.cooldown_steps)
-                continue
-
-            # High curvature → FP32
-            if st.curvature_proxy_ema > self.kappa:
-                st.mode = PrecisionMode.FP32
-                continue
-
-            # Low gradient variance → allow lower precision
-            if st.grad_var_ema < self.epsilon_g:
-                # Prefer FP8 if backend is enabled; else FP16
-                if self.fp8_backend == "te" and _TE_AVAILABLE:
-                    st.mode = PrecisionMode.FP8
-                else:
-                    st.mode = PrecisionMode.FP16
-                continue
-
-            # Default: FP16 for speed, unless signals suggest otherwise
-            st.mode = PrecisionMode.FP16
-
-    # Helper functions for users 
-
-    def checkpoint_contexts(self):
-        """Context managers for selective checkpointing using the *current* policy."""
-        policy = getattr(self, "_ckpt_policy", CheckpointPolicy.PREFER_SAVE)
-
-        def policy_fn(ctx, op, *args, **kwargs):
-            # You could branch on `op` or `ctx.is_recompute` here if you want.
-            return policy
-
-        return create_selective_checkpoint_contexts(policy_fn)
+    def _update_ckpt_gate(self) -> None:
+        r = self._read_headroom()
+        self._last_headroom = r
+        if r < self.ckpt_low:
+            self._ckpt_below += 1
+        elif r > self.ckpt_high:
+            self._ckpt_below = 0
+            self._ckpt_on = False
+        if (not self._ckpt_on) and (self._ckpt_below >= self.ckpt_need):
+            self._ckpt_on = True
