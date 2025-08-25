@@ -1,6 +1,5 @@
-# dpcs.py
 # Dynamic Precision + Checkpointing Scheduler (DPCS)
-# Minimal, practical seed. PyTorch is the only hard dependency.
+# PyTorch is the only hard dependency.
 # Optional: NVIDIA Transformer Engine (TE) for FP8 if installed.
 
 from __future__ import annotations
@@ -34,10 +33,9 @@ except Exception:
 # Utilities
 # -------------------------------
 
-def _leaf_modules(model: nn.Module) -> Iterable[Tuple[str, nn.Module]]:
-    """Yield only leaf modules (no children)."""
+def _leaf_modules(model):
     for name, m in model.named_modules():
-        if len(list(m.children())) == 0:
+        if len(list(m.children())) == 0 and any(p.requires_grad for p in m.parameters(recurse=False)):
             yield name, m
 
 
@@ -301,9 +299,10 @@ class DPCS:
             st = self._registry[name]
             # gradient energy & variance (cheap)
             gn2 = _flatten_grad_norm_sq(m)
-            var_now = _flatten_grad_var(m)
             st.grad_norm_sq_ema = self.ema_beta * st.grad_norm_sq_ema + (1 - self.ema_beta) * gn2
-            st.grad_var_ema = self.ema_beta * st.grad_var_ema + (1 - self.ema_beta) * var_now
+            if heavy:
+                var_now = _flatten_grad_var(m)
+                st.grad_var_ema = self.ema_beta * st.grad_var_ema + (1 - self.ema_beta) * var_now
 
             # curvature proxy: relative change in grad energy
             if st.grad_norm_sq_prev > 0.0:
@@ -363,9 +362,7 @@ class DPCS:
             # Default: FP16 for speed, unless signals suggest otherwise
             st.mode = PrecisionMode.FP16
 
-    # ---- Helpers for users --------------------------------------------------
-
-    
+    # Helper functions for users 
 
     def checkpoint_contexts(self):
         """Context managers for selective checkpointing using the *current* policy."""
@@ -376,38 +373,3 @@ class DPCS:
             return policy
 
         return create_selective_checkpoint_contexts(policy_fn)
-
-
-# -------------------------------
-# Example usage (put in your train script)
-# -------------------------------
-"""
-from dpcs import DPCS
-import torch, torch.nn as nn
-
-model = nn.Sequential(nn.Linear(4096, 4096), nn.GELU(), nn.Linear(4096, 4096)).cuda()
-dpcs = DPCS(epsilon_g=1e-3, kappa=5.0, fp8_backend="te")  # FP8 path auto-enables only if Transformer Engine is installed
-model = dpcs.wrap(model, allow_fp8=True)
-
-optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
-scaler = torch.amp.GradScaler("cuda")  # unified AMP API
-
-for step in range(10000):
-    dpcs.start_step()
-    optim.zero_grad(set_to_none=True)
-
-    # (Optional) Use selective activation checkpointing:
-    fwd_ctx, bwd_ctx = dpcs.checkpoint_contexts()
-    with fwd_ctx:
-        x = torch.randn(32, 4096, device="cuda")
-        with torch.autocast(device_type="cuda"):  # global safety; per-module DPCS shims will override locally
-            y = model(x)
-            loss = (y**2).mean()
-
-    scaler.scale(loss).backward()
-    dpcs.collect_signals(loss, model)
-
-    scaler.step(optim)
-    scaler.update()
-    dpcs.end_step(optim, scaler)
-"""
