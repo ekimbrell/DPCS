@@ -283,6 +283,36 @@ class DPCS:
                 self._fp8_ok = False
                 self._te = None
 
+    # --- Logging (optional JSONL sink) -----------------------------------------
+    def set_log_jsonl(self, path: str):
+        """
+        Enable per-step JSONL logging. Call with `None` or '' to disable.
+        """
+        import json, os
+        if not path:
+            self._log_cb = None
+            return
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        f = open(path, "a", buffering=1)  # line-buffered
+
+        def _emit(payload: dict):
+            try:
+                f.write(json.dumps(payload) + "\n")
+            except Exception:
+                pass
+
+        self._log_cb = _emit
+
+    def _emit_log(self, payload: dict):
+        cb = getattr(self, "_log_cb", None)
+        if cb is not None:
+            try:
+                cb(payload)
+            except Exception:
+                pass
+
+
     # (Optional) You can sanity-warn if user enabled precision scheduling without CUDA:
     # if self._prec_on and self.device_type != "cuda":
     #     warnings.warn("DPCS precision scheduling is optimized for CUDA autocast/GradScaler.", RuntimeWarning)
@@ -471,6 +501,18 @@ class DPCS:
                 "headroom": getattr(self, "_headroom", 1.0),
                 "modes": _count_modes(self._registry),
             })
+        # Emit one compact record per step
+        try:
+            mix = self.precision_mix() if hasattr(self, "precision_mix") else {}
+        except Exception:
+            mix = {}
+        self._emit_log({
+            "step": int(getattr(self, "_step", -1)),
+            "headroom": float(getattr(self, "_headroom", -1.0)),
+            "ckpt_on": bool(getattr(self, "_ckpt_on", False)),
+            "mix": mix,
+})
+
         self._freeze_active = False
         self._mode_freeze.clear()
     # ---- ergonomics ----
