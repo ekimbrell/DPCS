@@ -6,18 +6,21 @@ import torch
 import torch.nn as nn
 from dpcs import DPCS
 
+torch.backends.cudnn.benchmark = False  # avoid long autotune stalls
+torch.cuda.memory.set_per_process_memory_fraction(0.70)  # ~70% of visible VRAM
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 # --- Model dials (kept large; autofit will shrink batch/seq as needed) ---
-D_MODEL  = 1024
+D_MODEL  = 512
 N_HEADS  = 8
-FF_DIM   = 4096
-N_LAYERS = 12
+FF_DIM   = 2048
+N_LAYERS = 8
 DROPOUT  = 0.0
 
 # --- Workload starting guesses (autofit refines these) ---
-BATCH  = 8
-SEQ_LEN = 1536
+BATCH  = 2
+SEQ_LEN = 1024
 STEPS  = 60
 WARMUP = 20
 
@@ -32,6 +35,8 @@ class TinyTransformer(nn.Module):
         )
         self.enc = nn.TransformerEncoder(layer, num_layers=N_LAYERS)
         self.out = nn.Linear(D_MODEL, D_MODEL)
+
+    
 
     def forward(self, x):
         h = self.enc(x)              # (B, S, D)
@@ -131,6 +136,7 @@ def bench_baseline():
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scaler = torch.amp.GradScaler("cuda") if DEVICE == "cuda" else None
     x = rand_batch(BATCH, SEQ_LEN)
+    
     def step(_i):
         opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=DEVICE, dtype=(torch.float16 if DEVICE=="cuda" else torch.bfloat16), enabled=True):
@@ -153,8 +159,13 @@ def bench_dpcs_adaptive():
     def step(i):
         dpcs.start_step(); opt.zero_grad(set_to_none=True)
         fwd_ctx, _ = dpcs.checkpoint_contexts_if_needed()
-        with fwd_ctx, torch.autocast(device_type=DEVICE, dtype=(torch.float16 if DEVICE=="cuda" else torch.bfloat16), enabled=True):
+        
+        torch.cuda.reset_peak_memory_stats()
+        with fwd_ctx, torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
             y = model(x); loss = (y**2).mean()
+        torch.cuda.synchronize()
+        fwd_peak_mb = int(torch.cuda.max_memory_allocated()/1024/1024)
+        print("forward-only peak MB:", fwd_peak_mb)
         if scaler: scaler.scale(loss).backward(); dpcs.collect_signals(loss, model); scaler.step(opt); scaler.update()
         else:      loss.backward(); dpcs.collect_signals(loss, model); opt.step()
         dpcs.end_step(opt, scaler)

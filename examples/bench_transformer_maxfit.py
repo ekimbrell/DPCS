@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 from dpcs import DPCS
 
-torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.benchmark = False  # avoid long autotune stalls
+torch.cuda.memory.set_per_process_memory_fraction(0.70)  # ~70% of visible VRAM
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def mb(x): return int(x / (1024**2)) if x else 0
@@ -31,7 +33,7 @@ CANDIDATE_CFGS = [ModelCfg(768, 6, 3072, 8)]
 
 BATCH   = 4               # keep batch fixed; we vary sequence length
 SEQ_MIN = 128
-SEQ_MAX = 4096            # search upper bound
+SEQ_MAX = 4096           # search upper bound
 MARGIN  = 64              # require at least +64 tokens win to declare success
 
 # --------- tiny Transformer (parametric) ---------
@@ -92,8 +94,11 @@ def multi_step_fits(model: nn.Module, seq: int, dpcs: Optional[DPCS], steps=3, t
             fwd_ctx = (dpcs.checkpoint_contexts_if_needed()[0] if dpcs is not None
                        else torch.autocast(device_type=DEVICE, dtype=(torch.float16 if DEVICE=="cuda" else torch.bfloat16), enabled=True))
 
-            with fwd_ctx, torch.autocast(device_type=DEVICE, dtype=(torch.float16 if DEVICE=="cuda" else torch.bfloat16), enabled=True):
+            torch.cuda.reset_peak_memory_stats()
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
                 y = model(x); loss = (y**2).mean()
+            torch.cuda.synchronize()
+            print(f"[probe] forward-only peak MB @seq={seq}:", int(torch.cuda.max_memory_allocated()/1024/1024))
 
             if scaler:
                 scaler.scale(loss).backward()
