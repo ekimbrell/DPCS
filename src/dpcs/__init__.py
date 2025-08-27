@@ -1,6 +1,3 @@
-from .dpcs import DPCS
+from .dpcs import DPCS, DPCSConfig
 
-__all__ = ["DPCS"]
-__version__ = "0.1.0"
-
-
+__all__ = ["DPCS", "DPCSConfig"]

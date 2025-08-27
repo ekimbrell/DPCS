@@ -1,56 +1,41 @@
-# dpcs.py
+"""
+DPCS — Dynamic Precision & Checkpointing Scheduler (advanced)
+
+What this file provides (production-ready baseline):
+- Per-module precision policy (FP32/FP16/FP8*), with overflow cooldown
+- Real gradient variance via EMA of first/second moments
+- Curvature proxy via smoothed |Δ log ∥g∥|, optional Hutchinson HVP probe
+- Activation checkpointing with:
+  • headroom-driven hysteresis (ON/OFF votes)
+  • safety gating (only when some input requires_grad)
+  • activation-aware filter (only checkpoint modules whose last outputs were big)
+- Optional FP8 path via NVIDIA Transformer Engine (TE)
+
+(*) FP8 requires TE and FP8-capable hardware; otherwise falls back to FP16.
+"""
 from __future__ import annotations
+
 from dataclasses import dataclass
-from contextlib import nullcontext, contextmanager
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Type, Any
+
 import math
+import warnings
+
 import torch
 import torch.nn as nn
 from contextlib import contextmanager, nullcontext
 from torch.utils.checkpoint import checkpoint
-import torch.nn as nn
 from collections import Counter
-from dataclasses import dataclass
-from contextlib import contextmanager, nullcontext
 
+# --- Optional FP8 backend ----------------------------------------------------
 try:
-    import transformer_engine.pytorch as te  # Optional FP8
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch import recipe as te_recipe
     _TE_AVAILABLE = True
 except Exception:
+    te = None  # type: ignore
+    te_recipe = None  # type: ignore
     _TE_AVAILABLE = False
-
-@dataclass
-class _PrecState:
-    mode: str = "fp16"          # 'fp32' | 'fp16' | 'fp8'
-    cool: int = 0               # fp32 cooldown steps after overflow/instability
-    gnorm_ema: float = 0.0
-    gvar_ema: float = 0.0
-    curv_ema: float = 0.0
-
-
-
-@dataclass
-class _ModuleState:
-    # current numeric mode chosen by scheduler ('fp32' | 'fp16' | 'fp8')
-    mode: str = "fp16"
-
-    # cooldown counter (stay in fp32 for N steps after instability/overflow)
-    cool: int = 0
-
-    # exponential moving averages for decision signals
-    gnorm_ema: float = 0.0   # EMA of gradient L2 norm
-    gvar_ema: float = 0.0    # EMA of gradient variance
-    curv_ema: float = 0.0    # EMA of curvature proxy (e.g., |Δ log ||g|| |)
-
-    # book-keeping
-    last_update_step: int = -1  # last global step when stats/mode were updated
-    overflow_count: int = 0     # consecutive nonfinite/overflow detections
-    
-    grad_l2_ema: Optional[float] = None
-    grad_l2_ema_prev: Optional[float] = None
-    pending_overflow: bool = False
-    just_set_cooldown: bool = False   
-    
 
 
 # --- Utilities ---------------------------------------------------------------
@@ -58,78 +43,140 @@ class _ModuleState:
 def _has_cuda() -> bool:
     return torch.cuda.is_available()
 
-def _mem_headroom(device_type: str) -> float:
-    """
-    Return free/total device memory in [0,1]. Falls back to 1.0 if unknown.
-    Uses torch.cuda.memory.mem_get_info() on CUDA.  :contentReference[oaicite:1]{index=1}
-    """
-    try:
-        if device_type == "cuda" and _has_cuda():
-            free, total = torch.cuda.memory.mem_get_info()
-            return float(free) / float(total + 1e-9)
-    except Exception:
-        pass
-    return 1.0  # CPU/MPS default: treat as plenty of headroom
 
-def _is_leaf_module(mod: nn.Module) -> bool:
-    return len(list(mod.children())) == 0
-
-def _is_block_sequential(mod: nn.Module) -> bool:
-    # Wrap sequentials that are “blocks”: all of their children are leaves
-    if not isinstance(mod, nn.Sequential):
-        return False
-    kids = list(mod.children())
-    return len(kids) > 0 and all(_is_leaf_module(c) for c in kids)
-
-# add near the top of dpcs.py
-def _should_wrap_block(mod: nn.Module) -> bool:
-    if _is_leaf_module(mod):   # avoid leafs (Linear/GELU/etc.)
-        return False
-    if isinstance(mod, (nn.Sequential, nn.TransformerEncoderLayer)):
-        return True
-    # size gate: treat “big” modules as blocks
-    try:
-        n_params = sum(p.numel() for p in mod.parameters())
-    except Exception:
-        n_params = 0
-    return n_params >= 1_000_000
+def _ema(old: Optional[float], new: float, beta: float) -> float:
+    if old is None:
+        return float(new)
+    return float(beta * float(old) + (1.0 - beta) * float(new))
 
 
-# --- Core API ----------------------------------------------------------------
+def _args_require_grad(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> bool:
+    for t in args:
+        if torch.is_tensor(t) and t.requires_grad:
+            return True
+    for v in kwargs.values():
+        if torch.is_tensor(v) and v.requires_grad:
+            return True
+    return False
+
+
+def _estimate_bytes(obj: Any) -> int:
+    """Best-effort estimate of bytes held by a (possibly nested) tensor output."""
+    if torch.is_tensor(obj):
+        return int(obj.numel()) * int(obj.element_size())
+    if isinstance(obj, (list, tuple)):
+        return sum(_estimate_bytes(x) for x in obj)
+    if isinstance(obj, dict):
+        return sum(_estimate_bytes(v) for v in obj.values())
+    return 0
+
+
+# --- Internal state ----------------------------------------------------------
+
+@dataclass
+class _ModuleState:
+    mode: str = "fp16"        # 'fp32' | 'fp16' | 'fp8'
+    cool: int = 0
+
+    # gradient statistics (EMAs over steps)
+    grad_mean_ema: Optional[float] = None     # E[g]
+    grad_sqmean_ema: Optional[float] = None   # E[g^2]
+    gvar_ema: Optional[float] = None          # Var[g] ≈ E[g^2] - E[g]^2
+    grad_l2_ema: Optional[float] = None       # ||g||^2 / N (per-element)
+
+    # curvature proxy
+    curv_ema: Optional[float] = None          # EMA of |Δ log ||g|| |
+
+    # activation footprint (from previous forward)
+    last_act_bytes: Optional[int] = None
+
+    # overflow / control flags
+    pending_overflow: bool = False
+    just_set_cooldown: bool = False
+
+
+# --- Public config -----------------------------------------------------------
 
 @dataclass
 class DPCSConfig:
     # device / wrapping
     device_type: str = "cuda"
     allow_fp8: bool = False
-    fp8_backend: str = "te"           # or "none"
+    fp8_backend: str = "te"              # only 'te' supported
+    swap_modules_for_fp8: bool = True     # swap nn.Linear → te.Linear when possible
 
     # precision scheduler knobs
     enable_precision: bool = True
-    epsilon_g: float = 1e-3           # grad variance (proxy) threshold
-    kappa: float = 5.0                # curvature (proxy) threshold (stubbed for now)
-    cooldown_steps: int = 3           # steps to hold FP32 after overflow
-    ema_beta: float = 0.9             # EMA smoothing for grad signal
-    signals_freq_steps: int = 1       # recompute stats this often
+    epsilon_g: float = 1e-4               # variance threshold (tune per model)
+    kappa: float = 0.10                   # curvature threshold on |Δ log ||g|| |
+    cooldown_steps: int = 3               # steps to hold FP32 after instability
+    ema_beta: float = 0.9                 # EMA smoothing for stats
+    signals_freq_steps: int = 1           # compute stats every N steps
 
     # checkpointing hysteresis (based on headroom)
-    ckpt_low: float = 0.05            # turn ON ckpt if headroom <= low
-    ckpt_high: float = 0.20           # turn OFF ckpt if headroom >= high
-    ckpt_need: int = 2                # consecutive votes required
+    ckpt_low: float = 0.05                # turn ON ckpt if headroom <= low
+    ckpt_high: float = 0.20               # turn OFF ckpt if headroom >= high
+    ckpt_need: int = 2                    # consecutive votes required
 
-    # which module types we actually wrap
-    wrap_types: Tuple[Type[nn.Module], ...] = (nn.Linear,)
+    # activation-aware checkpointing
+    min_activation_bytes_to_ckpt: int = 8 << 20   # 8 MB default
+    ckpt_use_reentrant: bool = False              # recommended in recent PyTorch
 
+    # curvature (optional) Hutchinson HVP probe
+    curv_hvp_freq: int = 0                # 0 disables; else every N steps try HVP
+    curv_hvp_samples: int = 1             # Hutchinson probe samples when enabled
+
+    # which module types we wrap by default (include transformer blocks)
+    wrap_types: Tuple[Type[nn.Module], ...] = (nn.Linear, nn.TransformerEncoderLayer)
+
+
+# --- Main class --------------------------------------------------------------
 
 class DPCS:
-    """
-    Drop-in scheduler that:
-      - decides per-module precision (fp32/fp16/fp8) for the next step,
-      - decides whether to enable activation checkpointing for the next step.
-    """
+    def __init__(self, **kwargs):
+        self.cfg = DPCSConfig(**kwargs)
+        self.device_type = self.cfg.device_type
+        self._prec_on = bool(self.cfg.enable_precision)
+
+        # runtime state
+        self._step = 0
+        self._last_scale: Optional[float] = None
+        self._ckpt_on = False
+        self._ckpt_votes = 0
+        self._freeze_active: bool = False
+        self._mode_freeze: Dict[nn.Module, str] = {}
+        self._registry: Dict[nn.Module, _ModuleState] = {}
+        self._log_cb: Optional[Callable[[dict], None]] = None
+        self._headroom: float = self._snapshot_headroom()
+        self._cool: int = int(self.cfg.cooldown_steps)
+
+        # device dtypes
+        self._autocast_dtype = (
+            torch.float16 if self.device_type == "cuda" else torch.bfloat16
+        )
+
+        # FP8 setup (Transformer Engine)
+        self._fp8_ok = False
+        self._te = None
+        self._fp8_recipe = None
+        if self.cfg.allow_fp8 and self.cfg.fp8_backend == "te":
+            if _TE_AVAILABLE:
+                self._fp8_ok = True
+                self._te = te
+                try:
+                    self._fp8_recipe = te_recipe.DelayedScaling()
+                except Exception:
+                    self._fp8_recipe = None
+            else:
+                warnings.warn(
+                    "allow_fp8=True but Transformer Engine is not available; disabling FP8.",
+                    RuntimeWarning,
+                )
+
+    # ----- low-level helpers -------------------------------------------------
+
     def _snapshot_headroom(self) -> float:
-        # normalized free fraction; falls back to 1.0 if CUDA/mem_get_info unavailable
-        if self.device_type != "cuda" or not torch.cuda.is_available():
+        if self.device_type != "cuda" or not _has_cuda():
             return 1.0
         try:
             free, total = torch.cuda.mem_get_info()
@@ -137,107 +184,152 @@ class DPCS:
         except Exception:
             return 1.0
 
-
-
     def _has_nonfinite_grad(self, mod: nn.Module) -> bool:
         for p in mod.parameters(recurse=False):
-            if p.grad is not None:
-                g = p.grad
-                # Any NaN/Inf → treat as overflow signal
-                if not torch.isfinite(g).all():
-                    return True
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                return True
         return False
 
-        
+    def _emit_log(self, payload: dict) -> None:
+        cb = getattr(self, "_log_cb", None)
+        if cb is not None:
+            try:
+                cb(payload)
+            except Exception:
+                pass
+
+    def on_log(self, fn: Callable[[dict], None]) -> None:
+        self._log_cb = fn
+
+    def precision_mix(self) -> Dict[str, int]:
+        return dict(Counter(st.mode for st in self._registry.values())) if self._registry else {}
 
     def log_dict(self) -> dict:
-        mix = {}
-        for _, st in self._registry.items():
-            mix[st.mode] = mix.get(st.mode, 0) + 1
         try:
-            alloc = torch.cuda.memory.get_allocator_backend()  # 'native' or 'cudaMallocAsync'
+            alloc = torch.cuda.memory.get_allocator_backend()
         except Exception:
             alloc = "unknown"
-        info = {
+        return {
             "step": self._step,
-            "ckpt_on": bool(getattr(self, "_ckpt_on", False)),
-            "precision_mix": mix,
+            "ckpt_on": self._ckpt_on,
+            "precision_mix": self.precision_mix(),
             "device": str(self.device_type),
             "allocator_backend": alloc,
+            "headroom": float(getattr(self, "_headroom", 1.0)),
         }
-        # Attach headroom if you track it
-        if hasattr(self, "_headroom"):
-            info["headroom"] = float(self._headroom)
-        return info
 
-    
-    def _grad_l2_of(self, mod: torch.nn.Module) -> Optional[float]:
-        total = 0.0
-        any_grad = False
-        for p in mod.parameters(recurse=False):
-            if p.grad is not None:
-                any_grad = True
-                g = p.grad.detach()
-                total += float((g * g).sum().item())
-        return total if any_grad else None
+    def _activation_big_enough(self, mod: nn.Module) -> bool:
+        st = self._registry.get(mod)
+        if st is None:
+            return False
+        th = int(self.cfg.min_activation_bytes_to_ckpt)
+        return (st.last_act_bytes is not None) and (st.last_act_bytes >= th)
 
-    
-    def _update_stats_and_choose_mode(self, mod: nn.Module) -> None:
-        st = self._registry[mod]
+    # ----- FP8 module swap (optional) ---------------------------------------
 
-        # Grad L2 proxy (EMA). If no grads yet, keep last EMA.
-        total = 0.0
-        count = 0
-        for p in mod.parameters(recurse=False):
-            if p.grad is not None:
-                total += float(p.grad.detach().float().pow(2).mean().item())
-                count += 1
-        if count > 0:
-            cur_l2 = total / count
-            st.grad_l2_ema_prev = st.grad_l2_ema
-            st.grad_l2_ema = _ema_update(st.grad_l2_ema, cur_l2, self.cfg.ema_beta)
+    def _swap_model_fp8_modules(self, root: nn.Module) -> None:
+        if not (self._fp8_ok and self.cfg.swap_modules_for_fp8):
+            return
 
-        # Decision: prefer fp16 if “stable”, otherwise fp32
-        next_mode = "fp16"
-        if st.grad_l2_ema is None or st.grad_l2_ema >= self.cfg.epsilon_g:
-            next_mode = "fp32"
-        if getattr(st, "cool", 0) > 0:
-            next_mode = "fp32"
+        def _recurse(parent: nn.Module):
+            for name, child in list(parent.named_children()):
+                _recurse(child)
+                if isinstance(child, nn.Linear):
+                    te_lin = self._te.Linear(
+                        child.in_features,
+                        child.out_features,
+                        bias=(child.bias is not None),
+                        params_dtype=child.weight.dtype,
+                        device=child.weight.device,
+                    )
+                    with torch.no_grad():
+                        te_lin.weight.copy_(child.weight)
+                        if child.bias is not None:
+                            te_lin.bias.copy_(child.bias)
+                    setattr(parent, name, te_lin)
+        _recurse(root)
 
-        st.mode = next_mode
+    # ----- wrapping ----------------------------------------------------------
 
+    def wrap(self, model: nn.Module) -> nn.Module:
+        # Optionally swap modules to FP8-capable TE ops
+        self._swap_model_fp8_modules(model)
 
+        # Decide which types to wrap
+        wrap_types: Tuple[Type[nn.Module], ...] = self.cfg.wrap_types
+        if self._fp8_ok:
+            try:
+                wrap_types = tuple(set(list(wrap_types) + [self._te.Linear]))  # type: ignore
+            except Exception:
+                pass
 
-    def _ema_update(self, old, new, beta):
-        return float(beta * old + (1.0 - beta) * float(new))
+        for m in model.modules():
+            if isinstance(m, wrap_types) and not hasattr(m, "_dpcs_orig_forward"):
+                self._registry[m] = _ModuleState(mode="fp16")
+                m._dpcs_orig_forward = m.forward  # type: ignore[attr-defined]
 
-    def _module_params(self, mod):
-        return [p for p in mod.parameters(recurse=False) if p.grad is not None]
+                def make_fwd(mod: nn.Module):
+                    def fwd(*args, **kwargs):
+                        mode = self._mode_freeze.get(mod, self._registry[mod].mode)
 
-    def _grads_finite(self, mod) -> bool:
-        for p in self._module_params(mod):
-            if p.grad is None:
-                continue
-            if not torch.isfinite(p.grad).all():
-                return False
-        return True
+                        def _run(*a):
+                            return mod._dpcs_orig_forward(*a, **kwargs)  # type: ignore[attr-defined]
 
-        
-    def precision_mix(self) -> dict:
-        """
-        Return a dict like {'fp16': N1, 'fp32': N2, 'fp8': N3} summarizing the
-        current precision mode of all wrapped modules.
-        """
-        if not self._registry:
-            return {}
-        return dict(Counter(st.mode for st in self._registry.values()))
-    def debug_summary(self):
-        """Print what DPCS wrapped and current precision modes."""
-        items = []
-        for m, st in self._registry.items():
-            items.append((type(m).__name__, getattr(st, "mode", "fp16")))
-        items.sort(key=lambda t: t[0])
-        print("[DPCS] wrapped modules (type, mode):", items)
+                        # Should we checkpoint this module on this call?
+                        want_ckpt = (
+                            self._ckpt_on
+                            and _args_require_grad(args, kwargs)
+                            and self._activation_big_enough(mod)
+                        )
+
+                        # FP32 branch
+                        if mode == "fp32":
+                            if want_ckpt:
+                                out = checkpoint(_run, *args, use_reentrant=self.cfg.ckpt_use_reentrant)
+                            else:
+                                out = mod._dpcs_orig_forward(*args, **kwargs)  # type: ignore[attr-defined]
+                            # record activation size for future decisions
+                            self._registry[mod].last_act_bytes = _estimate_bytes(out)
+                            return out
+
+                        # FP8 branch (TE)
+                        if mode == "fp8" and self._fp8_ok:
+                            autocast_ctx = self._te.fp8_autocast(
+                                enabled=True,
+                                fp8_recipe=self._fp8_recipe,
+                            )
+                            with autocast_ctx:
+                                if want_ckpt:
+                                    out = checkpoint(_run, *args, use_reentrant=self.cfg.ckpt_use_reentrant)
+                                else:
+                                    out = mod._dpcs_orig_forward(*args, **kwargs)  # type: ignore[attr-defined]
+                            self._registry[mod].last_act_bytes = _estimate_bytes(out)
+                            return out
+
+                        # FP16/BF16 branch
+                        with torch.autocast(self.device_type, dtype=self._autocast_dtype, enabled=True):
+                            if want_ckpt:
+                                out = checkpoint(_run, *args, use_reentrant=self.cfg.ckpt_use_reentrant)
+                            else:
+                                out = mod._dpcs_orig_forward(*args, **kwargs)  # type: ignore[attr-defined]
+                        self._registry[mod].last_act_bytes = _estimate_bytes(out)
+                        return out
+
+                    return fwd
+
+                m.forward = make_fwd(m)  # type: ignore[method-assign]
+        return model
+
+    # ----- step lifecycle ----------------------------------------------------
+
+    def start_step(self) -> None:
+        self._step += 1
+        self._headroom = self._snapshot_headroom()
+
+    def checkpoint_contexts_if_needed(self):
+        if self._ckpt_on:
+            return self._checkpoint_region(), nullcontext()
+        return nullcontext(), nullcontext()
 
     @contextmanager
     def _checkpoint_region(self):
@@ -247,164 +339,86 @@ class DPCS:
         finally:
             self._freeze_active = False
 
+    # ----- signal collection -------------------------------------------------
 
-
-    def __init__(self, **kwargs):
-        # config first
-        self.cfg = DPCSConfig(**kwargs)
-        self._prec_on = bool(self.cfg.enable_precision)  # make collect_signals/end_step live
-        self._last_scale = None  # used by end_step to detect AMP scale drops (overflow hint)
-        self.device_type = self.cfg.device_type
-        
-
-        # internal state
-        self._step = 0
-        self._last_scale = None  # for GradScaler drop detection (overflow hint)
-        self._ckpt_on = False
-        self._ckpt_votes = 0
-        self._freeze_active: bool = False
-        self._mode_freeze: Dict[nn.Module, str] = {}
-        self._registry: Dict[nn.Module, _ModuleState] = {}
-        self._log_cb: Optional[Callable[[dict], None]] = None
-
-        # AMP scale tracking to detect recent overflow
-        # self._last_scale: Optional[float] = None
-
-        # snapshot headroom AFTER device_type exists
-        self._headroom: float = self._snapshot_headroom()
-
-        # optional FP8 backend gate (stub; wire later)
-        self._fp8_ok = False
-        self._te = None
-        if self.cfg.allow_fp8 and self.cfg.fp8_backend == "te":
-            try:
-                import transformer_engine.pytorch as te  # type: ignore
-                self._fp8_ok = True
-                self._te = te
-            except Exception:
-                self._fp8_ok = False
-                self._te = None
-
-
-    # --- Logging (optional JSONL sink) -----------------------------------------
-    def set_log_jsonl(self, path: str):
-        """
-        Enable per-step JSONL logging. Call with `None` or '' to disable.
-        """
-        import json, os
-        if not path:
-            self._log_cb = None
+    def collect_signals(self, loss: torch.Tensor, model: torch.nn.Module) -> None:
+        if not self._prec_on:
             return
 
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        f = open(path, "a", buffering=1)  # line-buffered
+        freq = max(1, int(self.cfg.signals_freq_steps))
+        heavy = (self._step % freq == 0)
 
-        def _emit(payload: dict):
-            try:
-                f.write(json.dumps(payload) + "\n")
-            except Exception:
-                pass
-
-        self._log_cb = _emit
-
-    def _emit_log(self, payload: dict):
-        cb = getattr(self, "_log_cb", None)
-        if cb is not None:
-            try:
-                cb(payload)
-            except Exception:
-                pass
-
-
-    # (Optional) You can sanity-warn if user enabled precision scheduling without CUDA:
-    # if self._prec_on and self.device_type != "cuda":
-    #     warnings.warn("DPCS precision scheduling is optimized for CUDA autocast/GradScaler.", RuntimeWarning)
-
-
-    def wrap(self, model: nn.Module) -> nn.Module:
-        # register modules we care about
-        for m in model.modules():
-            if isinstance(m, self.cfg.wrap_types) and not hasattr(m, "_dpcs_orig_forward"):
-                self._registry[m] = _ModuleState(mode="fp16")
-                m._dpcs_orig_forward = m.forward  # type: ignore[attr-defined]
-
-                def make_fwd(mod: nn.Module):
-                    def run_with_local_autocast(*a, **k):
-                        mode = self._mode_freeze.get(mod, self._registry[mod].mode)
-                        if mode == "fp32":
-                            return mod._dpcs_orig_forward(*a, **k)  # type: ignore[attr-defined]
-                        dtype = torch.float16  # fp8 path wired later if available
-                        with torch.autocast(device_type=self.device_type, dtype=dtype, enabled=True):
-                            return mod._dpcs_orig_forward(*a, **k)  # type: ignore[attr-defined]
-                    def fwd(*args, **kwargs):
-                        if self._freeze_active:
-                            return run_with_local_autocast(*args, **kwargs)
-                        return run_with_local_autocast(*args, **kwargs)
-                    return fwd
-                m.forward = make_fwd(m)  # type: ignore[method-assign]
-        return model
-
-    
-    
-    def start_step(self) -> None:
-        self._step += 1
-        self._headroom = self._snapshot_headroom()
-
-
-    def checkpoint_contexts_if_needed(self):
-        if self._ckpt_on:
-            return self._checkpoint_region(), nullcontext()
-        return nullcontext(), nullcontext()
-    
-    def collect_signals(self, loss: torch.Tensor, model: torch.nn.Module):
-        """
-        Lightweight per-step signal collection. DO NOT change cooldown here.
-        Only compute stats and flag pending_overflow; mode/cooldown changes are centralized in end_step().
-        """
-        if not getattr(self, "_prec_on", False):
-            return
-
-        for mod in self._registry.keys():
-            st = self._registry[mod]
-
-            # If grads exist and any are non-finite under this module, flag overflow.
-            # Don't touch st.cool here; end_step() will start cooldown and mark just_set_cooldown.
+        for mod, st in self._registry.items():
+            # overflow sniff
             try:
                 for p in mod.parameters(recurse=False):
-                    if p.grad is None:
-                        continue
-                    if not torch.isfinite(p.grad).all():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
                         st.pending_overflow = True
                         break
             except Exception:
-                # Conservative: also flag overflow on unexpected errors
                 st.pending_overflow = True
 
-            # --- (Optional) update any EMA stats you keep for precision decisions ---
+            # gradient stats (heavy path optional)
             try:
-                g2 = 0.0
-                cnt = 0
+                g_sum = 0.0
+                g_sqsum = 0.0
+                count = 0
                 for p in mod.parameters(recurse=False):
                     if p.grad is None:
                         continue
-                    g2 += float(p.grad.detach().to(dtype=torch.float32).pow(2).sum().item())
-                    cnt += p.numel()
-                if cnt > 0:
-                    g2 = g2 / cnt
-                    st.grad_l2_ema = self._ema(st.grad_l2_ema, g2, self.cfg.ema_beta)
+                    g = p.grad.detach().to(dtype=torch.float32)
+                    g_sum += float(g.sum().item())
+                    g_sqsum += float(g.pow(2).sum().item())
+                    count += g.numel()
+                if count > 0:
+                    g_mean = g_sum / count
+                    g_sqmean = g_sqsum / count
+                    st.grad_mean_ema = _ema(st.grad_mean_ema, g_mean, self.cfg.ema_beta)
+                    st.grad_sqmean_ema = _ema(st.grad_sqmean_ema, g_sqmean, self.cfg.ema_beta)
+                    var_est = max(0.0, g_sqmean - g_mean * g_mean)
+                    st.gvar_ema = _ema(st.gvar_ema, var_est, self.cfg.ema_beta)
+
+                    cur_l2 = g_sqmean
+                    if st.grad_l2_ema is not None:
+                        dlog = abs(math.log(cur_l2 + 1e-12) - math.log(st.grad_l2_ema + 1e-12))
+                        st.curv_ema = _ema(st.curv_ema, dlog, self.cfg.ema_beta)
+                    st.grad_l2_ema = _ema(st.grad_l2_ema, cur_l2, self.cfg.ema_beta)
             except Exception:
                 pass
 
-    def end_step(self, optim: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None) -> None:
-        """
-        Decide next-step precision per module + checkpointing gate using:
-        - device headroom (hysteresis gate),
-        - recent overflow hint (if GradScaler scale dropped),
-        - grad variance proxy (EMA on grad L2) and curvature proxy,
-        - cooldown that holds fp32 for a fixed number of steps after an overflow.
-        """
+            # Optional Hutchinson HVP probe (conservative)
+            if heavy and self.cfg.curv_hvp_freq > 0 and (self._step % self.cfg.curv_hvp_freq == 0):
+                try:
+                    if loss.requires_grad and torch.is_grad_enabled():
+                        hv_trace = 0.0
+                        samples = max(1, int(self.cfg.curv_hvp_samples))
+                        params = [p for p in mod.parameters(recurse=False) if p.requires_grad]
+                        if params:
+                            grads = [p.grad.detach() if p.grad is not None else torch.zeros_like(p) for p in params]
+                            g_flat = torch.cat([g.reshape(-1) for g in grads])
+                            for _ in range(samples):
+                                v = torch.randint_like(g_flat, low=0, high=2).float() * 2 - 1
+                                v_parts = []
+                                ofs = 0
+                                for p in params:
+                                    n = p.numel()
+                                    v_parts.append(v[ofs:ofs+n].view_as(p))
+                                    ofs += n
+                                hv = torch.autograd.grad(
+                                    grads, params, grad_outputs=v_parts, retain_graph=True, allow_unused=True
+                                )
+                                hv = [h if h is not None else torch.zeros_like(p) for h, p in zip(hv, params)]
+                                hv_flat = torch.cat([h.reshape(-1) for h in hv])
+                                hv_trace += float((hv_flat * v).sum().item())
+                            hv_trace /= float(samples * (g_flat.numel() + 1e-12))
+                            st.curv_ema = _ema(st.curv_ema, abs(hv_trace), self.cfg.ema_beta)
+                except Exception:
+                    pass
 
-        # --- 1) Checkpointing hysteresis votes (unchanged logic) ---
+    # ----- policy application ------------------------------------------------
+
+    def end_step(self, optim: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None) -> None:
+        # 1) Checkpointing hysteresis votes
         low, high, need = self.cfg.ckpt_low, self.cfg.ckpt_high, self.cfg.ckpt_need
         vote_on = (self._headroom <= low)
         vote_off = (self._headroom >= high)
@@ -419,125 +433,73 @@ class DPCS:
             self._ckpt_on = False
             self._ckpt_votes = 0
 
-        # --- 2) Overflow hint via GradScaler.get_scale() ---
-        # If scale strictly dropped since the last step, treat as an overflow hint.  (PyTorch practice)  # noqa
-        # Ref: forum suggestion to check scaler.get_scale() to detect skipped steps / scale drop.
-        # (We do not cite code here; logic mirrors public guidance.)  # noqa
+        # 2) Global overflow via GradScaler scale drop
         force_fp32_global = False
         if scaler is not None and hasattr(scaler, "get_scale"):
             try:
                 cur_scale = float(scaler.get_scale())
-                if getattr(self, "_last_scale", None) is not None and cur_scale < float(self._last_scale):
+                if self._last_scale is not None and cur_scale < float(self._last_scale):
                     force_fp32_global = True
                 self._last_scale = cur_scale
             except Exception:
-                pass  # stay conservative
+                pass
 
-        # --- 3) Per-module next-mode decision ---
+        # 3) Per-module next-mode decision
         for m, st in self._registry.items():
-
-            # 3a) If module is cooling, keep fp32 and decrement (except the step we set it)
+            # cooldown wins
             if st.cool > 0:
                 st.mode = "fp32"
-                if getattr(st, "just_set_cooldown", False):
-                    # Hold value on the step we entered cooldown; decrement starting next step
+                if st.just_set_cooldown:
                     st.just_set_cooldown = False
                 else:
                     st.cool = max(st.cool - 1, 0)
                 continue
 
-            # 3b) If we have a global overflow hint, force fp32 and enter cooldown
-            if force_fp32_global:
-                st.mode = "fp32"
-                st.cool = max(st.cool, self._cool)  # self._cool mirrors cfg.cooldown_steps
-                st.just_set_cooldown = True
-                st.pending_overflow = False
-                continue
-
-            # 3c) Optional: live non-finite grad sniff on this module to trigger cooldown fast
-            force_now = False
-            try:
-                if hasattr(self, "_has_nonfinite_grad") and callable(self._has_nonfinite_grad):
-                    if self._has_nonfinite_grad(m):
-                        force_now = True
-            except Exception:
-                pass
-
-            if st.pending_overflow or force_now:
+            # enforce FP32 on overflow
+            if force_fp32_global or st.pending_overflow or self._has_nonfinite_grad(m):
                 st.mode = "fp32"
                 st.cool = max(st.cool, self._cool)
                 st.just_set_cooldown = True
                 st.pending_overflow = False
                 continue
 
-            # 3d) Normal policy
-            # Optimistic warm-start: if no EMA yet, prefer low precision (test expects fp16 on the first clean step)
-            if st.grad_l2_ema is None:
-                next_mode = "fp16"
-            else:
-                # Your seed decision: low precision when grads are stable or curvature large
-                drop_by_grad = (st.grad_l2_ema < self.cfg.epsilon_g)
-                drop_by_curv = (st.curv_ema is not None and st.curv_ema > self.cfg.kappa)
-                if drop_by_grad or drop_by_curv:
-                    next_mode = "fp16"   # later: gate to 'fp8' when backend & arch allow
+            # variance + curvature policy
+            gvar = st.gvar_ema if st.gvar_ema is not None else float("inf")
+            curv = st.curv_ema if st.curv_ema is not None else 0.0
+            drop = (gvar < self.cfg.epsilon_g) or (curv > self.cfg.kappa)
+            if drop:
+                if self._fp8_ok and self.cfg.allow_fp8:
+                    st.mode = "fp8"
                 else:
-                    next_mode = "fp32" if self._fp32_pref() else "fp16"
+                    st.mode = "fp16"
+            else:
+                st.mode = "fp32" if (self._headroom > 0.5) else "fp16"
 
-            st.mode = next_mode
-
-        # --- 4) Optional step log ---
-        if self._log_cb:
-            self._log_cb({
-                "step": self._step,
-                "ckpt_on": self._ckpt_on,
-                "headroom": getattr(self, "_headroom", 1.0),
-                "modes": _count_modes(self._registry),
-            })
-        # compact record for file logging (if enabled)
-        try:
-            mix = self.precision_mix() if hasattr(self, "precision_mix") else {}
-        except Exception:
-            mix = {}
+        # 4) log
         self._emit_log({
-            "step": int(getattr(self, "_step", -1)),
-            "headroom": float(getattr(self, "_headroom", -1.0)),
-            "ckpt_on": bool(getattr(self, "_ckpt_on", False)),
-            "mix": mix,
+            "step": int(self._step),
+            "headroom": float(self._headroom),
+            "ckpt_on": bool(self._ckpt_on),
+            "mix": self.precision_mix(),
         })
 
-        # --- 5) Cleanup freezes (if you use them elsewhere) ---
+        # 5) cleanup
         self._freeze_active = False
         self._mode_freeze.clear()
 
-
-
-
-    
-    # ---- ergonomics ----
-    def on_log(self, fn: Callable[[dict], None]) -> None:
-        self._log_cb = fn
+    # ----- ergonomics --------------------------------------------------------
 
     def is_checkpointing(self) -> bool:
         return self._ckpt_on
 
     def modes_summary(self) -> Dict[str, int]:
-        return _count_modes(self._registry)
+        return self.precision_mix()
 
-# --- Internal helpers --------------------------------------------------------
 
+# --- helpers -----------------------------------------------------------------
 
 def _count_modes(reg: Dict[nn.Module, _ModuleState]) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for st in reg.values():
         out[st.mode] = out.get(st.mode, 0) + 1
     return out
-
-@contextmanager
-def _checkpoint_region(self):
-    """Enable per-module checkpointing for the current forward region."""
-    self._ckpt_depth += 1
-    try:
-        yield
-    finally:
-        self._ckpt_depth -= 1
-
