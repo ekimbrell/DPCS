@@ -1,8 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple, Any, Iterable, Type
+from typing import Callable, Dict, Optional, Tuple, Any, Type, List, Set
 from collections import Counter
-from contextlib import contextmanager, nullcontext
 import math
 import torch
 import torch.nn as nn
@@ -49,8 +48,13 @@ class _ModuleState:
 
     # running stats for precision/autotune
     grad_l2_ema: Optional[float] = None
+    grad_l2_ema_prev: Optional[float] = None
     gvar_ema: Optional[float] = None
     curv_ema: Optional[float] = None
+
+    # per-step samples
+    last_var_step: Optional[float] = None
+    last_curv_step: Optional[float] = None
 
     # activation bookkeeping (for ckpt policy)
     last_act_bytes: int = 0
@@ -87,13 +91,24 @@ class DPCSConfig:
     # signals compute cadence (1 = every step)
     signals_freq_steps: int = 1
 
-    # checkpointing policy
+    # warm-up autotune for precision thresholds
+    autotune_precision: bool = False
+    autotune_warmup_steps: int = 0
+    autotune_gvar_percentile: float = 0.5   # e.g., median
+    autotune_curv_percentile: float = 0.5
+    autotune_min_eps: float = 1e-12
+    autotune_min_kappa: float = 1e-12
+
+    # checkpointing policy: block gating and rank selection
     min_activation_bytes_to_ckpt: int = 16 << 20   # 16 MiB gate
-    ckpt_low: float = 0.05                         # headroom hysteresis (not used here directly)
-    ckpt_high: float = 0.20
-    ckpt_need: int = 2
-    ckpt_harmful_delta_bytes: int = 8 << 20        # if local peak rises > 8 MiB while ckpt'ing this block
-    ckpt_harmful_patience: int = 3                  # consecutive steps before blacklisting
+    ckpt_harmful_delta_bytes: int = 8 << 20        # local peak rises > 8 MiB while ckpt'ing this block
+    ckpt_harmful_patience: int = 3                 # consecutive steps before blacklisting
+
+    # NEW: rank-based selection (top-K by activation bytes)
+    ckpt_enable_topk: bool = True
+    ckpt_topk_frac: float = 0.3                    # checkpoint top 30% biggest blocks
+    ckpt_min_candidates: int = 1                   # at least this many when any exist
+    ckpt_max_blocks: Optional[int] = None          # hard cap; None = no cap
 
     # which module types we precision-wrap vs ckpt-wrap
     wrap_types: Tuple[Type[nn.Module], ...] = (nn.Linear, nn.TransformerEncoderLayer)
@@ -112,7 +127,6 @@ class DPCS:
         # state
         self._step = 0
         self._ckpt_on = False
-        self._ckpt_votes = 0
         self._registry: Dict[nn.Module, _ModuleState] = {}
         self._mode_freeze: Dict[nn.Module, str] = {}
         self._freeze_active: bool = False
@@ -131,6 +145,16 @@ class DPCS:
         # precision toggle determines autocast use; stats are always collected
         self._prec_on = bool(self.cfg.enable_precision)
 
+        # warm-up autotune pools
+        self._warm_enabled: bool = bool(self.cfg.autotune_precision and self.cfg.autotune_warmup_steps > 0)
+        self._warm_done: bool = False
+        self._warm_seen_steps: int = 0
+        self._warm_gvars: List[float] = []
+        self._warm_curvs: List[float] = []
+
+        # per-step checkpoint selection (top-K)
+        self._ckpt_selected: Set[nn.Module] = set()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -148,7 +172,6 @@ class DPCS:
                         for sub in mod_.modules():
                             if isinstance(sub, (nn.Dropout, nn.AlphaDropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d)) and sub.p > 0 and sub.training:
                                 return True
-                            # common patterns exposing 'dropout' float on modules (e.g., Transformer)
                             if hasattr(sub, "dropout") and isinstance(getattr(sub, "dropout"), float) and getattr(sub, "dropout") > 0 and sub.training:
                                 return True
                         return False
@@ -167,16 +190,20 @@ class DPCS:
                         return torch.float16
 
                     def _maybe_checkpoint(fn, *a, **k):
-                        # Only checkpoint for block modules (ckpt_wrap_types) and when policy says so.
+                        # Checkpoint only if selected via top-K for this step
                         if not self._ckpt_on:
                             return fn(*a, **k)
                         if not isinstance(mod, self.cfg.ckpt_wrap_types):
                             return fn(*a, **k)
                         if st.ckpt_blacklisted:
                             return fn(*a, **k)
-                        # gate by last observed act size; if unknown yet, skip this step
-                        if st.last_act_bytes < self.cfg.min_activation_bytes_to_ckpt:
-                            return fn(*a, **k)
+                        if self.cfg.ckpt_enable_topk:
+                            if mod not in self._ckpt_selected:
+                                return fn(*a, **k)
+                        else:
+                            # legacy absolute threshold path
+                            if st.last_act_bytes < self.cfg.min_activation_bytes_to_ckpt:
+                                return fn(*a, **k)
 
                         preserve = _needs_rng_state(mod)
 
@@ -255,24 +282,115 @@ class DPCS:
     # ------------------------------------------------------------------
     def start_step(self) -> None:
         self._step += 1
+        # Build the per-step top-K selection set for checkpointing
+        self._ckpt_selected.clear()
+        if not self._ckpt_on or not self.cfg.ckpt_enable_topk:
+            return
+        # collect eligible candidates
+        cands: List[Tuple[int, nn.Module]] = []
+        for m, st in self._registry.items():
+            if not isinstance(m, self.cfg.ckpt_wrap_types):
+                continue
+            if st.ckpt_blacklisted:
+                continue
+            if st.last_act_bytes < self.cfg.min_activation_bytes_to_ckpt:
+                continue
+            cands.append((st.last_act_bytes, m))
+        if not cands:
+            return
+        cands.sort(key=lambda t: t[0], reverse=True)
+        # compute K
+        K = len(cands)
+        if self.cfg.ckpt_topk_frac > 0:
+            K = max(int(math.ceil(self.cfg.ckpt_topk_frac * len(cands))), int(self.cfg.ckpt_min_candidates))
+        if self.cfg.ckpt_max_blocks is not None:
+            K = min(K, int(self.cfg.ckpt_max_blocks))
+        K = max(0, min(K, len(cands)))
+        selected = [m for _, m in cands[:K]]
+        self._ckpt_selected = set(selected)
+
+    def _variance_and_l2_mean(self, mod: nn.Module) -> Optional[Tuple[float, float]]:
+        """Return (population variance, mean(g^2)) across all param grads in module, or None if no grads."""
+        total_elems = 0
+        s = 0.0
+        ss = 0.0
+        for p in mod.parameters(recurse=False):
+            g = p.grad
+            if g is None:
+                continue
+            g32 = g.detach().to(torch.float32)
+            total_elems += g32.numel()
+            s  += float(g32.sum().item())
+            ss += float((g32 * g32).sum().item())
+        if total_elems == 0:
+            return None
+        mean = s / total_elems
+        var = max(ss / total_elems - mean * mean, 0.0)  # population variance
+        l2_mean = ss / total_elems                       # E[g^2]
+        return var, l2_mean
 
     def collect_signals(self, loss: torch.Tensor, model: nn.Module):
         # Stats collection is independent of precision toggle
         beta = self.cfg.ema_beta
+        # per-step pools for autotune
+        step_gvars: List[float] = []
+        step_curvs: List[float] = []
+
         for mod, st in self._registry.items():
             try:
-                g2 = 0.0
-                cnt = 0
-                for p in mod.parameters(recurse=False):
-                    if p.grad is None:
-                        continue
-                    g2 += float(p.grad.detach().to(dtype=torch.float32).pow(2).sum().item())
-                    cnt += p.numel()
-                if cnt > 0:
-                    g2 = g2 / cnt
-                    st.grad_l2_ema = _ema(st.grad_l2_ema, g2, beta)
+                out = self._variance_and_l2_mean(mod)
+                if out is not None:
+                    var, l2_mean = out
+                    # per-step variance sample
+                    st.last_var_step = var
+                    st.gvar_ema = _ema(st.gvar_ema, var, beta)
+
+                    # grad-L2 EMA + curvature proxy (ensure defined curvature on first step)
+                    if st.grad_l2_ema is None:
+                        st.grad_l2_ema = l2_mean
+                        st.grad_l2_ema_prev = l2_mean
+                        st.last_curv_step = 0.0
+                    else:
+                        prev = st.grad_l2_ema
+                        st.grad_l2_ema = _ema(prev, l2_mean, beta)
+                        eps = 1e-12
+                        st.last_curv_step = abs(math.log(st.grad_l2_ema + eps) - math.log(prev + eps))
+
+                    # accumulate for autotune pools (now always defined)
+                    step_gvars.append(st.last_var_step)
+                    step_curvs.append(st.last_curv_step)
             except Exception:
                 pass
+
+        # warm-up autotune after finishing this step
+        if self._warm_enabled and not self._warm_done:
+            self._warm_seen_steps += 1
+            self._warm_gvars.extend(step_gvars)
+            self._warm_curvs.extend(step_curvs)
+            if self._warm_seen_steps >= int(self.cfg.autotune_warmup_steps):
+                # compute percentiles (torch.quantile expects tensor)
+                try:
+                    if len(self._warm_gvars) > 0:
+                        t_g = torch.tensor(self._warm_gvars, dtype=torch.float64)
+                        qg = torch.tensor(float(self.cfg.autotune_gvar_percentile), dtype=torch.float64)
+                        eps_ref = float(torch.quantile(t_g, qg).item())
+                    else:
+                        eps_ref = float(self.cfg.autotune_min_eps)
+                except Exception:
+                    eps_ref = float(self.cfg.autotune_min_eps)
+                try:
+                    if len(self._warm_curvs) > 0:
+                        t_c = torch.tensor(self._warm_curvs, dtype=torch.float64)
+                        qc = torch.tensor(float(self.cfg.autotune_curv_percentile), dtype=torch.float64)
+                        kap_ref = float(torch.quantile(t_c, qc).item())
+                    else:
+                        kap_ref = float(self.cfg.autotune_min_kappa)
+                except Exception:
+                    kap_ref = float(self.cfg.autotune_min_kappa)
+
+                self.cfg.epsilon_g = max(eps_ref, float(self.cfg.autotune_min_eps))
+                self.cfg.kappa     = max(kap_ref, float(self.cfg.autotune_min_kappa))
+                self._warm_done = True
 
     def end_step(self, optim: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None) -> None:
         # global overflow hint via GradScaler scale drop
@@ -303,7 +421,7 @@ class DPCS:
                 st.pending_overflow = False
                 continue
 
-            # default policy: prefer low precision when grads are small or curvature large (stub curv)
+            # default policy: prefer low precision when grads are small (curv optional)
             if st.grad_l2_ema is None:
                 next_mode = "fp16"
             else:
@@ -318,10 +436,11 @@ class DPCS:
             mix = self.modes_summary()
         except Exception:
             mix = {}
-        self._emit_log({
-            "step": int(self._step),
-            "mix": mix,
-        })
+        if self._log_cb:
+            self._emit_log({
+                "step": int(self._step),
+                "mix": mix,
+            })
 
         self._freeze_active = False
         self._mode_freeze.clear()
