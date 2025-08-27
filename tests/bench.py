@@ -2,33 +2,15 @@
 """
 DPCS micro-benchmark harness
 
-Runs a small grid over:
-  - checkpointing:       off / on
-  - precision scheduling: off / on
-  - FP8 (Transformer Engine): off / on (only if available)
-
-Collects per-run metrics:
-  - avg_step_ms, samples_per_s (and tokens_per_s for Transformer)
-  - final loss
-  - CUDA peak allocator bytes (if on CUDA)
-  - precision mix summary from DPCS
-  - overflow hints (GradScaler scale drops)
-
-Outputs JSONL (one line per run) and prints a compact table.
-
-Examples
---------
-# MLP on CUDA, 24 steps, large batch, JSONL to results.jsonl
-python bench.py --model mlp --device cuda --steps 24 --batch 64 \
-  --width 8192 --depth 10 --classes 1000 --jsonl results.jsonl
-
-# Transformer on CUDA, force MATH SDPA for clearer checkpoint memory deltas
-python bench.py --model transformer --device cuda --steps 20 --batch 8 \
-  --seq 1024 --d-model 512 --nhead 8 --ff 2048 --layers 6 --force-math-sdpa
+Changes in this version:
+- (Modern AMP) Uses torch.amp APIs.
+- (OOM resilience) Auto backoff batch size by 2× on CUDA OOM; rebuilds model/run until success or batch==1.
+- (Optimizer choice) --optimizer {sgd, adamw} to stress activations or optimizer state.
+- (SDPA selection) --sdpa {default, math, flash, mem_efficient} using torch.nn.attention.sdpa_kernel where available; falls back to torch.backends.cuda.sdp_kernel.
+- (Defaults) MLP defaults trimmed to be more feasible; use CLI to scale up.
 """
 import argparse
 import json
-import math
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -40,36 +22,44 @@ import torch.optim as optim
 
 from dpcs import DPCS
 
-# -------- SDPA backend control (version-portable) ----------------------------
 
-def make_force_math_sdpa():
+# -------- SDPA backend control (modern first, fallback) ----------------------
+
+def make_sdpa_ctx(backend: str):
+    backend = (backend or "default").lower()
+    # Prefer new API
     try:
-        from torch.nn.attention import sdpa_kernel, SDPBackend  # PyTorch ≥2.3ish
-
-        def _ctx():
-            return sdpa_kernel([SDPBackend.MATH])
-
-        return _ctx
+        from torch.nn.attention import sdpa_kernel, SDPBackend  # PyTorch >= 2.3
+        mapping = {
+            "default": None,
+            "math": [SDPBackend.MATH],
+            "flash": [SDPBackend.FLASH_ATTENTION],
+            "mem_efficient": [SDPBackend.EFFICIENT_ATTENTION],
+        }
+        targets = mapping.get(backend)
+        if targets is None:
+            return nullcontext()
+        return sdpa_kernel(targets)
     except Exception:
+        # Fallback to deprecated API
         try:
-            from torch.backends.cuda import sdp_kernel as _old  # deprecated API
-
-            def _ctx():
-                return _old(enable_flash=False, enable_mem_efficient=False, enable_math=True)
-
-            return _ctx
+            from torch.backends.cuda import sdp_kernel as old_sdpa
+            if backend == "math":
+                return old_sdpa(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+            if backend == "flash":
+                return old_sdpa(enable_flash=True, enable_mem_efficient=False, enable_math=False)
+            if backend == "mem_efficient":
+                return old_sdpa(enable_flash=False, enable_mem_efficient=True, enable_math=False)
         except Exception:
-            def _ctx():
-                return nullcontext()
-
-            return _ctx
+            pass
+        return nullcontext()
 
 
 # -------- Models -------------------------------------------------------------
 
 class DeepMLP(nn.Module):
     """Activation-heavy MLP to magnify checkpointing effects."""
-    def __init__(self, width=8192, depth=10, out_dim=1000):
+    def __init__(self, width=4096, depth=8, out_dim=1000):
         super().__init__()
         layers: List[nn.Module] = []
         layers.append(nn.Linear(width, width))
@@ -124,8 +114,9 @@ class RunConfig:
     enable_precision: bool = False
     allow_fp8: bool = False
 
-    force_math_sdpa: bool = False
+    sdpa_backend: str = "default"  # default|math|flash|mem_efficient
     min_ckpt_bytes: int = 8 << 20
+    optimizer: str = "sgd"         # sgd|adamw
 
 
 @dataclass
@@ -163,10 +154,6 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _num_params(m: nn.Module) -> int:
-    return sum(p.numel() for p in m.parameters())
-
-
 def _device_select(arg: str) -> str:
     if arg == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -176,7 +163,6 @@ def _device_select(arg: str) -> str:
 def _pretty_bytes(n: Optional[int]) -> str:
     if n is None:
         return "-"
-    # kib / mib / gib
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
     x = float(n)
     i = 0
@@ -188,7 +174,7 @@ def _pretty_bytes(n: Optional[int]) -> str:
 
 def _print_table(rows: List[RunResult]) -> None:
     cols = [
-        ("run_id", 9), ("device", 5), ("model_kind", 11), ("ckpt", 4), ("prec", 4), ("fp8", 3),
+        ("run_id", 13), ("device", 5), ("model_kind", 11), ("ckpt", 4), ("prec", 4), ("fp8", 3),
         ("avg_ms", 8), ("samp/s", 10), ("tok/s", 10), ("loss", 10), ("cuda_peak", 12)
     ]
     header = " ".join(name.ljust(w) for name, w in cols)
@@ -211,13 +197,13 @@ def _print_table(rows: List[RunResult]) -> None:
         print(" ".join(str(values[name]).ljust(w) for name, w in cols))
 
 
-# -------- Core bench ---------------------------------------------------------
+# -------- Build model & run --------------------------------------------------
 
 def build_model(cfg: RunConfig) -> Tuple[nn.Module, torch.Tensor, Optional[torch.Tensor]]:
     device = cfg.device
     if cfg.model_kind == "mlp":
-        width = cfg.width or 8192
-        depth = cfg.depth or 10
+        width = cfg.width or 4096
+        depth = cfg.depth or 8
         classes = cfg.classes
         model = DeepMLP(width=width, depth=depth, out_dim=classes).to(device)
         x = torch.randn(cfg.batch, width, device=device)
@@ -238,10 +224,18 @@ def build_model(cfg: RunConfig) -> Tuple[nn.Module, torch.Tensor, Optional[torch
         raise ValueError(f"Unknown model_kind: {cfg.model_kind}")
 
 
-def run_once(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
-    device = cfg.device
-    force_math_sdpa = make_force_math_sdpa()
+def _make_optimizer(model: nn.Module, which: str) -> optim.Optimizer:
+    which = which.lower()
+    if which == "sgd":
+        return optim.SGD(model.parameters(), lr=1e-2, momentum=0.0)
+    if which == "adamw":
+        return optim.AdamW(model.parameters(), lr=1e-3)
+    raise ValueError(f"Unknown optimizer: {which}")
 
+
+def _train_loop(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
+    """One full run; may raise RuntimeError (OOM)."""
+    device = cfg.device
     model, x, y = build_model(cfg)
 
     # Scheduler
@@ -254,9 +248,10 @@ def run_once(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
     )
     model = dpcs.wrap(model)
 
-    # Optimizer & (optional) GradScaler for CUDA when precision is on
-    opt = optim.AdamW(model.parameters(), lr=1e-3)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and cfg.enable_precision))
+    # Optimizer & AMP
+    opt = _make_optimizer(model, cfg.optimizer)
+    amp_enabled = (device == "cuda" and cfg.enable_precision)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     crit = nn.CrossEntropyLoss().to(device)
 
     # Control checkpointing explicitly for the whole run
@@ -274,20 +269,19 @@ def run_once(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
     if cfg.model_kind == "transformer":
         tokens_per_step = cfg.batch * (cfg.seq or 1024)
 
-    # A per-run SDPA context if requested and device is CUDA
-    sdpa_ctx = force_math_sdpa() if (cfg.force_math_sdpa and device == "cuda" and cfg.model_kind == "transformer") else nullcontext()
+    sdpa_ctx = make_sdpa_ctx(cfg.sdpa_backend) if (device == "cuda" and cfg.model_kind == "transformer") else nullcontext()
 
     last_loss = float("nan")
 
     with sdpa_ctx:
-        for step in range(cfg.steps):
+        for _ in range(cfg.steps):
             t0 = time.perf_counter()
 
             dpcs.start_step()
 
             # forward
             if scaler.is_enabled():
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast("cuda"):
                     logits = model(x)
                     loss = crit(logits, y)
             else:
@@ -311,7 +305,7 @@ def run_once(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
                 opt.step()
             opt.zero_grad(set_to_none=True)
 
-            # end scheduler step (for decisions, cooldown, logging)
+            # end scheduler step
             dpcs.end_step(opt, scaler if scaler.is_enabled() else None)
 
             if device == "cuda":
@@ -327,7 +321,7 @@ def run_once(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
     cuda_peak = int(torch.cuda.max_memory_allocated(device)) if device == "cuda" else None
 
     result = RunResult(
-        run_id=f"{cfg.model_kind[:3]}-c{int(cfg.ckpt_on)}-p{int(cfg.enable_precision)}-8{int(cfg.allow_fp8)}",
+        run_id=f"{cfg.model_kind[:3]}-c{int(cfg.ckpt_on)}-p{int(cfg.enable_precision)}-8{int(cfg.allow_fp8)}-{cfg.optimizer}",
         device=device,
         model_kind=cfg.model_kind,
         steps=cfg.steps,
@@ -358,6 +352,24 @@ def run_once(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
     return result
 
 
+def run_once_with_backoff(cfg: RunConfig, jsonl: Optional[str]) -> RunResult:
+    """Run with CUDA OOM backoff: halves batch until it fits (>=1)."""
+    device = cfg.device
+    while True:
+        try:
+            return _train_loop(cfg, jsonl)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            oom = ("out of memory" in msg) or ("cuda error: out of memory" in msg)
+            if not oom or device != "cuda" or cfg.batch <= 1:
+                raise
+            # Backoff batch and retry
+            new_batch = max(1, cfg.batch // 2)
+            print(f"[bench] CUDA OOM at batch={cfg.batch}; retrying with batch={new_batch}")
+            cfg = RunConfig(**{**cfg.__dict__, "batch": new_batch})
+            torch.cuda.empty_cache()
+
+
 # -------- Main ---------------------------------------------------------------
 
 def main():
@@ -367,16 +379,16 @@ def main():
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--batch", type=int, default=8)
 
-    # Transformer-only sizes
+    # Transformer sizes
     p.add_argument("--seq", type=int, default=1024)
     p.add_argument("--d-model", type=int, default=512)
     p.add_argument("--nhead", type=int, default=8)
     p.add_argument("--ff", type=int, default=2048)
     p.add_argument("--layers", type=int, default=6)
 
-    # MLP-only sizes
-    p.add_argument("--width", type=int, default=8192)
-    p.add_argument("--depth", type=int, default=10)
+    # MLP sizes (trimmed defaults)
+    p.add_argument("--width", type=int, default=4096)
+    p.add_argument("--depth", type=int, default=8)
 
     # General
     p.add_argument("--classes", type=int, default=1000)
@@ -384,18 +396,32 @@ def main():
     p.add_argument("--seed", type=int, default=123)
 
     # DPCS behavior
-    p.add_argument("--force-math-sdpa", action="store_true", help="Force math SDPA (transformer+CUDA)")
+    p.add_argument("--sdpa", choices=["default", "math", "flash", "mem_efficient"], default="default")
     p.add_argument("--min-ckpt-bytes", type=int, default=(8 << 20))
 
-    # Grid control (by default runs combinations)
+    # Grid control
     p.add_argument("--ckpt", choices=["grid", "off", "on"], default="grid")
     p.add_argument("--precision", choices=["grid", "off", "on"], default="grid")
     p.add_argument("--fp8", choices=["grid", "off", "on"], default="grid")
 
+    # Optimizer selection
+    p.add_argument("--optimizer", choices=["sgd", "adamw"], default="sgd")
+
+    # Back-compat shim for the old flag
+    p.add_argument("--force-math-sdpa", action="store_true", help="(deprecated) use --sdpa math")
+
     args = p.parse_args()
 
-    set_seed(args.seed)
+    # seed
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
     device = _device_select(args.device)
+
+    sdpa_backend = args.sdpa
+    if args.force_math_sdpa and sdpa_backend == "default":
+        print("[bench] --force-math-sdpa is deprecated; using --sdpa math")
+        sdpa_backend = "math"
 
     # Build base RunConfig
     base = RunConfig(
@@ -411,8 +437,9 @@ def main():
         width=args.width,
         depth=args.depth,
         classes=args.classes,
-        force_math_sdpa=bool(args.force_math_sdpa),
+        sdpa_backend=sdpa_backend,
         min_ckpt_bytes=int(args.min_ckpt_bytes),
+        optimizer=args.optimizer,
     )
 
     # Enumerate grid
@@ -439,12 +466,34 @@ def main():
                 if f8 and not te_available:
                     print("[skip] FP8 run requested but Transformer Engine is not available.")
                     continue
-                cfg = base
-                cfg = RunConfig(**{**cfg.__dict__, "ckpt_on": bool(ck), "enable_precision": bool(pr), "allow_fp8": bool(f8)})
-                r = run_once(cfg, args.jsonl)
+                cfg = RunConfig(**{**base.__dict__, "ckpt_on": bool(ck), "enable_precision": bool(pr), "allow_fp8": bool(f8)})
+                # OOM-resilient run
+                r = run_once_with_backoff(cfg, args.jsonl)
                 results.append(r)
 
-    _print_table(results)
+    # table
+    cols = [
+        ("run_id", 14), ("device", 5), ("model_kind", 11), ("ckpt", 4), ("prec", 4), ("fp8", 3),
+        ("avg_ms", 8), ("samp/s", 10), ("tok/s", 10), ("loss", 10), ("cuda_peak", 12)
+    ]
+    header = " ".join(name.ljust(w) for name, w in cols)
+    print("\n" + header)
+    print("-" * len(header))
+    for r in results:
+        values = {
+            "run_id": r.run_id,
+            "device": r.device,
+            "model_kind": r.model_kind,
+            "ckpt": "Y" if r.ckpt_on else "N",
+            "prec": "Y" if r.enable_precision else "N",
+            "fp8": "Y" if r.allow_fp8 else "N",
+            "avg_ms": f"{r.avg_step_ms:.2f}",
+            "samp/s": f"{r.samples_per_s:.2f}",
+            "tok/s": f"{0.0 if r.tokens_per_s is None else r.tokens_per_s:.2f}",
+            "loss": f"{r.loss_last:.4f}",
+            "cuda_peak": _pretty_bytes(r.cuda_peak_bytes),
+        }
+        print(" ".join(str(values[name]).ljust(w) for name, w in cols))
 
 
 if __name__ == "__main__":
