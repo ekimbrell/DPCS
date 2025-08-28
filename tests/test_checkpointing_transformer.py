@@ -24,19 +24,10 @@ except Exception:  # pragma: no cover
         FLASH_ATTENTION = "FLASH_ATTENTION"
 
 
-def sdpa_names(backends):
-    names = []
-    for b in backends:
-        if _SDPA_OK and hasattr(SDPBackend, "__members__"):
-            # real Enum in newer PyTorch
-            try:
-                names.append(b.name)
-                continue
-            except Exception:
-                pass
-        # fallback: string or simple attr
-        names.append(getattr(b, "name", str(b)))
-    return ",".join(names)
+def set_seed(seed=0):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 # --- tiny model: Transformer encoder + classifier ----------------------------
@@ -51,12 +42,6 @@ class TinyTransformer(nn.Module):
     def forward(self, x):
         h = self.enc(x)
         return self.cls(h[:, 0])
-
-
-def set_seed(seed=0):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def _force_fp32_modes(sched: DPCS):
@@ -76,12 +61,11 @@ def test_checkpointing_equivalence_numeric_cpu_transformer(device):
     x = torch.randn(B, S, D, device=device)
     y = torch.randint(0, C, (B,), device=device)
 
-    # use explicit SDPA backend in the scheduler; print it for visibility
-    sdpa_bes = [SDPBackend.MATH]
-    print(f"[test] SDPA backends: {sdpa_names(sdpa_bes)}")
+    # Use explicit SDPA backend in the scheduler; and in this test use the single-enum form
+    print("[test] SDPA backend: MATH")
 
-    sched_a = DPCS(device_type=device, enable_precision=False, sdpa_backends=sdpa_bes)
-    sched_b = DPCS(device_type=device, enable_precision=False, sdpa_backends=sdpa_bes)
+    sched_a = DPCS(device_type=device, enable_precision=False, sdpa_backends=(SDPBackend.MATH,))
+    sched_b = DPCS(device_type=device, enable_precision=False, sdpa_backends=(SDPBackend.MATH,))
     model_a = sched_a.wrap(model_a)
     model_b = sched_b.wrap(model_b)
     _force_fp32_modes(sched_a)
@@ -91,13 +75,15 @@ def test_checkpointing_equivalence_numeric_cpu_transformer(device):
     sched_a._ckpt_on = False
     crit = nn.CrossEntropyLoss()
     model_a.zero_grad(set_to_none=True)
-    la = crit(model_a(x), y)
+    with sdpa_kernel(SDPBackend.MATH):
+        la = crit(model_a(x), y)
     la.backward()
 
     # checkpointed
     sched_b._ckpt_on = True
     model_b.zero_grad(set_to_none=True)
-    lb = crit(model_b(x), y)
+    with sdpa_kernel(SDPBackend.MATH):
+        lb = crit(model_b(x), y)
     lb.backward()
 
     assert torch.allclose(la, lb, rtol=1e-6, atol=1e-6)
@@ -108,7 +94,7 @@ def test_checkpointing_reduces_peak_memory_cuda_transformer_single_model():
     """
     Single-model CUDA memory regression on a Transformer encoder stack.
     Wrap entire TransformerEncoderLayer so attention is checkpointed too.
-    Use a version-portable SDPA context to force 'math' backend for clearer deltas.
+    Force 'math' SDPA backend for clearer deltas.
     Success: checkpointing reduces peak allocator bytes by >=3%.
     """
     set_seed(321)
@@ -117,12 +103,11 @@ def test_checkpointing_reduces_peak_memory_cuda_transformer_single_model():
     B, S, D, C = 8, 1024, 512, 1000
     model = TinyTransformer(d_model=D, nhead=8, dim_ff=2048, nlayers=6, n_classes=C, dropout=0.0).to(device)
 
-    sdpa_bes = (SDPBackend.MATH,)
-    print(f"[test] SDPA backends: {sdpa_names(sdpa_bes)}")
+    print("[test] SDPA backend: MATH")
 
     sched = DPCS(device_type=device, enable_precision=False,
                  wrap_types=(nn.Linear, nn.TransformerEncoderLayer),
-                 sdpa_backends=sdpa_bes, force_sdpa_in_blocks=True)
+                 sdpa_backends=(SDPBackend.MATH,), force_sdpa_in_blocks=True)
     model = sched.wrap(model)
     _force_fp32_modes(sched)
 
