@@ -52,15 +52,6 @@ def _ema(old: Optional[float], new: float, beta: float) -> float:
     return float(new if old is None else beta * float(old) + (1.0 - beta) * float(new))
 
 
-def _sdpa_arg(arg):
-    """Convert tuple/list/single into what torch.nn.attention.sdpa_kernel expects.
-    Must be either a single SDPBackend or a list of SDPBackend instances.
-    """
-    if isinstance(arg, (tuple, list)):
-        return arg[0] if len(arg) == 1 else list(arg)
-    return arg
-
-
 # --- Per-module state ---------------------------------------------------------
 
 @dataclass
@@ -270,8 +261,7 @@ class DPCS:
                         # SDPA robustness: if this is a Transformer block and the knob is on,
                         # enter a stable sdpa_kernel context so comparisons are apples-to-apples.
                         is_tx = isinstance(mod, nn.TransformerEncoderLayer)
-                        sdpa_ctx = sdpa_kernel(_sdpa_arg(self._sdpa_backends)) if (self.cfg.force_sdpa_in_blocks and is_tx) else nullcontext()
-
+                        sdpa_ctx = sdpa_kernel(self._sdpa_backends) if (self.cfg.force_sdpa_in_blocks and is_tx) else nullcontext()
 
                         if ac_enabled:
                             with torch.autocast(device_type=self.device_type, dtype=dtype, enabled=True):
