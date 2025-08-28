@@ -1,21 +1,37 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple, Any, Type, List, Set
+from typing import Callable, Dict, Optional, Tuple, Any, Type, List, Set, Iterable
 from collections import Counter
+from contextlib import contextmanager, nullcontext
 import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+# --- Optional dependencies ----------------------------------------------------
 try:
-    import transformer_engine.pytorch as te  # Optional FP8
+    import transformer_engine.pytorch as te  # Optional FP8 backend (not exercised here)
     _TE_AVAILABLE = True
 except Exception:
     _TE_AVAILABLE = False
 
-# -----------------------------------------------------------------------------
-# Small helpers
-# -----------------------------------------------------------------------------
+# SDPA kernel context (PyTorch >= 2.1). Provide a safe fallback for older versions.
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend  # PyTorch 2.1+
+    _SDPA_AVAILABLE = True
+except Exception:  # pragma: no cover - fallback path
+    _SDPA_AVAILABLE = False
+
+    @contextmanager
+    def sdpa_kernel(*_args, **_kwargs):  # type: ignore[misc]
+        yield
+
+    class SDPBackend:  # type: ignore[override]
+        MATH = "MATH"
+        EFFICIENT_ATTENTION = "EFFICIENT_ATTENTION"
+        FLASH_ATTENTION = "FLASH_ATTENTION"
+
+# --- Small helpers ------------------------------------------------------------
 
 def _has_cuda() -> bool:
     return torch.cuda.is_available()
@@ -36,9 +52,16 @@ def _ema(old: Optional[float], new: float, beta: float) -> float:
     return float(new if old is None else beta * float(old) + (1.0 - beta) * float(new))
 
 
-# -----------------------------------------------------------------------------
-# State
-# -----------------------------------------------------------------------------
+def _sdpa_arg(arg):
+    """Convert tuple/list/single into what torch.nn.attention.sdpa_kernel expects.
+    Must be either a single SDPBackend or a list of SDPBackend instances.
+    """
+    if isinstance(arg, (tuple, list)):
+        return arg[0] if len(arg) == 1 else list(arg)
+    return arg
+
+
+# --- Per-module state ---------------------------------------------------------
 
 @dataclass
 class _ModuleState:
@@ -50,7 +73,6 @@ class _ModuleState:
     grad_l2_ema: Optional[float] = None
     grad_l2_ema_prev: Optional[float] = None
     gvar_ema: Optional[float] = None
-    curv_ema: Optional[float] = None
 
     # per-step samples
     last_var_step: Optional[float] = None
@@ -68,18 +90,12 @@ class _ModuleState:
     ckpt_blacklisted: bool = False
 
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# --- Config -------------------------------------------------------------------
 
 @dataclass
 class DPCSConfig:
     # device / wrapping
     device_type: str = "cuda"
-
-    # FP8
-    allow_fp8: bool = False
-    fp8_backend: str = "te"
 
     # precision scheduler knobs
     enable_precision: bool = True
@@ -88,36 +104,35 @@ class DPCSConfig:
     cooldown_steps: int = 3
     ema_beta: float = 0.9
 
-    # signals compute cadence (1 = every step)
-    signals_freq_steps: int = 1
-
     # warm-up autotune for precision thresholds
     autotune_precision: bool = False
     autotune_warmup_steps: int = 0
-    autotune_gvar_percentile: float = 0.5   # e.g., median
+    autotune_gvar_percentile: float = 0.5
     autotune_curv_percentile: float = 0.5
     autotune_min_eps: float = 1e-12
     autotune_min_kappa: float = 1e-12
 
-    # checkpointing policy: block gating and rank selection
+    # checkpointing policy (top-K by activation size)
     min_activation_bytes_to_ckpt: int = 16 << 20   # 16 MiB gate
-    ckpt_harmful_delta_bytes: int = 8 << 20        # local peak rises > 8 MiB while ckpt'ing this block
-    ckpt_harmful_patience: int = 3                 # consecutive steps before blacklisting
+    ckpt_harmful_delta_bytes: int = 8 << 20
+    ckpt_harmful_patience: int = 3
 
-    # NEW: rank-based selection (top-K by activation bytes)
     ckpt_enable_topk: bool = True
-    ckpt_topk_frac: float = 0.3                    # checkpoint top 30% biggest blocks
-    ckpt_min_candidates: int = 1                   # at least this many when any exist
-    ckpt_max_blocks: Optional[int] = None          # hard cap; None = no cap
+    ckpt_topk_frac: float = 0.3
+    ckpt_min_candidates: int = 1
+    ckpt_max_blocks: Optional[int] = None
 
     # which module types we precision-wrap vs ckpt-wrap
     wrap_types: Tuple[Type[nn.Module], ...] = (nn.Linear, nn.TransformerEncoderLayer)
     ckpt_wrap_types: Tuple[Type[nn.Module], ...] = (nn.Sequential, nn.TransformerEncoderLayer)
 
+    # --- NEW: SDPA & checkpoint robustness knobs ---
+    force_sdpa_in_blocks: bool = True
+    # Accept either SDPBackend enums or their names ('MATH', 'EFFICIENT_ATTENTION', 'FLASH_ATTENTION')
+    sdpa_backends: Tuple[Any, ...] = (SDPBackend.MATH,)  # type: ignore[name-defined]
 
-# -----------------------------------------------------------------------------
-# Main scheduler
-# -----------------------------------------------------------------------------
+
+# --- Main scheduler -----------------------------------------------------------
 
 class DPCS:
     def __init__(self, **kwargs):
@@ -135,13 +150,6 @@ class DPCS:
         # AMP scale tracking (overflow hint)
         self._last_scale: Optional[float] = None
 
-        # FP8 gate
-        self._fp8_ok = False
-        self._te = None
-        if self.cfg.allow_fp8 and self.cfg.fp8_backend == "te" and _TE_AVAILABLE:
-            self._fp8_ok = True
-            self._te = te
-
         # precision toggle determines autocast use; stats are always collected
         self._prec_on = bool(self.cfg.enable_precision)
 
@@ -155,9 +163,25 @@ class DPCS:
         # per-step checkpoint selection (top-K)
         self._ckpt_selected: Set[nn.Module] = set()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        # normalize sdpa backends once
+        self._sdpa_backends = self._normalize_sdpa_backends(self.cfg.sdpa_backends)
+
+    # --- SDPA backends normalization -------------------------------------
+    def _normalize_sdpa_backends(self, backends: Iterable[Any]) -> Tuple[Any, ...]:
+        norm: List[Any] = []
+        for b in backends:
+            if _SDPA_AVAILABLE and isinstance(b, SDPBackend):  # already enum
+                norm.append(b)
+            elif _SDPA_AVAILABLE and isinstance(b, str):
+                name = b.upper()
+                if hasattr(SDPBackend, name):
+                    norm.append(getattr(SDPBackend, name))
+            else:
+                # fallback path or unknown: keep as-is; sdpa_kernel will be a no-op
+                norm.append(b)
+        return tuple(norm)
+
+    # --- Public API -------------------------------------------------------
     def wrap(self, model: nn.Module) -> nn.Module:
         for m in model.modules():
             if isinstance(m, self.cfg.wrap_types) and not hasattr(m, "_dpcs_orig_forward"):
@@ -168,7 +192,6 @@ class DPCS:
                     st = self._registry[mod]
 
                     def _needs_rng_state(mod_: nn.Module) -> bool:
-                        # fast scan for stochastic ops (dropout); if any active, preserve RNG
                         for sub in mod_.modules():
                             if isinstance(sub, (nn.Dropout, nn.AlphaDropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d)) and sub.p > 0 and sub.training:
                                 return True
@@ -177,37 +200,54 @@ class DPCS:
                         return False
 
                     def _local_autocast_enabled() -> bool:
-                        # precision scheduling off => always run FP32 (no autocast)
                         if not self._prec_on:
                             return False
                         mode = self._mode_freeze.get(mod, st.mode)
-                        return mode in ("fp16", "fp8")
+                        return mode in ("fp16", "fp8")  # fp8 path would be provided by a backend adapter
 
                     def _local_dtype():
-                        # prefer bf16 when available for better stability; else fp16
                         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                             return torch.bfloat16
                         return torch.float16
 
+                    def _ensure_topk_selected_if_needed():
+                        # Lazy top-K selection so users who forget start_step() still checkpoint
+                        if not self._ckpt_on or not self.cfg.ckpt_enable_topk or self._ckpt_selected:
+                            return
+                        cands: List[Tuple[int, nn.Module]] = []
+                        for m2, st2 in self._registry.items():
+                            if not isinstance(m2, self.cfg.ckpt_wrap_types):
+                                continue
+                            if st2.ckpt_blacklisted:
+                                continue
+                            if st2.last_act_bytes < self.cfg.min_activation_bytes_to_ckpt:
+                                continue
+                            cands.append((st2.last_act_bytes, m2))
+                        if not cands:
+                            return
+                        cands.sort(key=lambda t: t[0], reverse=True)
+                        K = max(int(math.ceil(self.cfg.ckpt_topk_frac * len(cands))), int(self.cfg.ckpt_min_candidates))
+                        if self.cfg.ckpt_max_blocks is not None:
+                            K = min(K, int(self.cfg.ckpt_max_blocks))
+                        self._ckpt_selected = set(m for _, m in cands[:K])
+
                     def _maybe_checkpoint(fn, *a, **k):
-                        # Checkpoint only if selected via top-K for this step
                         if not self._ckpt_on:
                             return fn(*a, **k)
                         if not isinstance(mod, self.cfg.ckpt_wrap_types):
                             return fn(*a, **k)
                         if st.ckpt_blacklisted:
                             return fn(*a, **k)
+
+                        _ensure_topk_selected_if_needed()
                         if self.cfg.ckpt_enable_topk:
                             if mod not in self._ckpt_selected:
                                 return fn(*a, **k)
                         else:
-                            # legacy absolute threshold path
                             if st.last_act_bytes < self.cfg.min_activation_bytes_to_ckpt:
                                 return fn(*a, **k)
 
                         preserve = _needs_rng_state(mod)
-
-                        # local peak measurement (CUDA only) to detect harmful modules
                         pre_peak = torch.cuda.max_memory_allocated() if _has_cuda() else 0
                         out = checkpoint(fn, *a, use_reentrant=False, preserve_rng_state=preserve, **k)
                         if _has_cuda():
@@ -220,21 +260,28 @@ class DPCS:
                                 st.harmful_count = 0
                         return out
 
+                    def _body(*a, **k):
+                        return mod._dpcs_orig_forward(*a, **k)  # type: ignore[attr-defined]
+
                     def fwd(*args, **kwargs):
-                        # precision (autocast) selection
                         ac_enabled = _local_autocast_enabled()
                         dtype = _local_dtype()
 
-                        def _body(*a, **k):
-                            return mod._dpcs_orig_forward(*a, **k)  # type: ignore[attr-defined]
+                        # SDPA robustness: if this is a Transformer block and the knob is on,
+                        # enter a stable sdpa_kernel context so comparisons are apples-to-apples.
+                        is_tx = isinstance(mod, nn.TransformerEncoderLayer)
+                        sdpa_ctx = sdpa_kernel(_sdpa_arg(self._sdpa_backends)) if (self.cfg.force_sdpa_in_blocks and is_tx) else nullcontext()
+
 
                         if ac_enabled:
                             with torch.autocast(device_type=self.device_type, dtype=dtype, enabled=True):
-                                out = _maybe_checkpoint(_body, *args, **kwargs)
+                                with sdpa_ctx:
+                                    out = _maybe_checkpoint(_body, *args, **kwargs)
                         else:
-                            out = _maybe_checkpoint(_body, *args, **kwargs)
+                            with sdpa_ctx:
+                                out = _maybe_checkpoint(_body, *args, **kwargs)
 
-                        # update activation size after the fact for next-step gating
+                        # update activation size for next-step gating
                         try:
                             self._registry[mod].last_act_bytes = _tensor_bytes(out)
                         except Exception:
@@ -246,7 +293,7 @@ class DPCS:
                 m.forward = make_fwd(m)  # type: ignore[method-assign]
         return model
 
-    # logging helpers
+    # --- Logging helpers --------------------------------------------------
     def precision_mix(self) -> dict:
         if not self._registry:
             return {}
@@ -277,16 +324,13 @@ class DPCS:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # Step lifecycle
-    # ------------------------------------------------------------------
+    # --- Step lifecycle ---------------------------------------------------
     def start_step(self) -> None:
         self._step += 1
         # Build the per-step top-K selection set for checkpointing
         self._ckpt_selected.clear()
         if not self._ckpt_on or not self.cfg.ckpt_enable_topk:
             return
-        # collect eligible candidates
         cands: List[Tuple[int, nn.Module]] = []
         for m, st in self._registry.items():
             if not isinstance(m, self.cfg.ckpt_wrap_types):
@@ -299,7 +343,6 @@ class DPCS:
         if not cands:
             return
         cands.sort(key=lambda t: t[0], reverse=True)
-        # compute K
         K = len(cands)
         if self.cfg.ckpt_topk_frac > 0:
             K = max(int(math.ceil(self.cfg.ckpt_topk_frac * len(cands))), int(self.cfg.ckpt_min_candidates))
@@ -309,8 +352,8 @@ class DPCS:
         selected = [m for _, m in cands[:K]]
         self._ckpt_selected = set(selected)
 
+    # --- Stats collection -------------------------------------------------
     def _variance_and_l2_mean(self, mod: nn.Module) -> Optional[Tuple[float, float]]:
-        """Return (population variance, mean(g^2)) across all param grads in module, or None if no grads."""
         total_elems = 0
         s = 0.0
         ss = 0.0
@@ -330,9 +373,7 @@ class DPCS:
         return var, l2_mean
 
     def collect_signals(self, loss: torch.Tensor, model: nn.Module):
-        # Stats collection is independent of precision toggle
         beta = self.cfg.ema_beta
-        # per-step pools for autotune
         step_gvars: List[float] = []
         step_curvs: List[float] = []
 
@@ -341,11 +382,9 @@ class DPCS:
                 out = self._variance_and_l2_mean(mod)
                 if out is not None:
                     var, l2_mean = out
-                    # per-step variance sample
                     st.last_var_step = var
                     st.gvar_ema = _ema(st.gvar_ema, var, beta)
 
-                    # grad-L2 EMA + curvature proxy (ensure defined curvature on first step)
                     if st.grad_l2_ema is None:
                         st.grad_l2_ema = l2_mean
                         st.grad_l2_ema_prev = l2_mean
@@ -356,35 +395,22 @@ class DPCS:
                         eps = 1e-12
                         st.last_curv_step = abs(math.log(st.grad_l2_ema + eps) - math.log(prev + eps))
 
-                    # accumulate for autotune pools (now always defined)
                     step_gvars.append(st.last_var_step)
                     step_curvs.append(st.last_curv_step)
             except Exception:
                 pass
 
-        # warm-up autotune after finishing this step
         if self._warm_enabled and not self._warm_done:
             self._warm_seen_steps += 1
             self._warm_gvars.extend(step_gvars)
             self._warm_curvs.extend(step_curvs)
             if self._warm_seen_steps >= int(self.cfg.autotune_warmup_steps):
-                # compute percentiles (torch.quantile expects tensor)
                 try:
-                    if len(self._warm_gvars) > 0:
-                        t_g = torch.tensor(self._warm_gvars, dtype=torch.float64)
-                        qg = torch.tensor(float(self.cfg.autotune_gvar_percentile), dtype=torch.float64)
-                        eps_ref = float(torch.quantile(t_g, qg).item())
-                    else:
-                        eps_ref = float(self.cfg.autotune_min_eps)
+                    eps_ref = float(torch.quantile(torch.tensor(self._warm_gvars, dtype=torch.float64), torch.tensor(float(self.cfg.autotune_gvar_percentile), dtype=torch.float64)).item()) if self._warm_gvars else float(self.cfg.autotune_min_eps)
                 except Exception:
                     eps_ref = float(self.cfg.autotune_min_eps)
                 try:
-                    if len(self._warm_curvs) > 0:
-                        t_c = torch.tensor(self._warm_curvs, dtype=torch.float64)
-                        qc = torch.tensor(float(self.cfg.autotune_curv_percentile), dtype=torch.float64)
-                        kap_ref = float(torch.quantile(t_c, qc).item())
-                    else:
-                        kap_ref = float(self.cfg.autotune_min_kappa)
+                    kap_ref = float(torch.quantile(torch.tensor(self._warm_curvs, dtype=torch.float64), torch.tensor(float(self.cfg.autotune_curv_percentile), dtype=torch.float64)).item()) if self._warm_curvs else float(self.cfg.autotune_min_kappa)
                 except Exception:
                     kap_ref = float(self.cfg.autotune_min_kappa)
 
@@ -392,8 +418,8 @@ class DPCS:
                 self.cfg.kappa     = max(kap_ref, float(self.cfg.autotune_min_kappa))
                 self._warm_done = True
 
+    # --- Step end ---------------------------------------------------------
     def end_step(self, optim: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None) -> None:
-        # global overflow hint via GradScaler scale drop
         force_fp32_global = False
         if scaler is not None and hasattr(scaler, "get_scale"):
             try:
@@ -405,7 +431,6 @@ class DPCS:
                 pass
 
         for m, st in self._registry.items():
-            # cooldown handling
             if st.cool > 0:
                 st.mode = "fp32"
                 if st.just_set_cooldown:
@@ -421,31 +446,23 @@ class DPCS:
                 st.pending_overflow = False
                 continue
 
-            # default policy: prefer low precision when grads are small (curv optional)
             if st.grad_l2_ema is None:
                 next_mode = "fp16"
             else:
-                if st.grad_l2_ema < self.cfg.epsilon_g:
-                    next_mode = "fp16"
-                else:
-                    next_mode = "fp32"
+                next_mode = "fp16" if st.grad_l2_ema < self.cfg.epsilon_g else "fp32"
             st.mode = next_mode
 
         # optional compact log
-        try:
-            mix = self.modes_summary()
-        except Exception:
-            mix = {}
         if self._log_cb:
-            self._emit_log({
-                "step": int(self._step),
-                "mix": mix,
-            })
+            try:
+                self._log_cb({"step": int(self._step), "mix": self.modes_summary()})
+            except Exception:
+                pass
 
         self._freeze_active = False
         self._mode_freeze.clear()
 
-    # convenience
+    # --- Convenience ------------------------------------------------------
     def on_log(self, fn: Callable[[dict], None]) -> None:
         self._log_cb = fn
 
