@@ -15,3 +15,20 @@ dist/
 # VSCode / PyCharm
 .vscode/
 .idea/
+
+out-hf-dpcs/# training outputs / artifacts
+out-hf-dpcs/
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+*.npz
+*.npy
+.cache/
+datasets/
+data/
