@@ -18,7 +18,7 @@ dist/
 
 out-hf-dpcs/# training outputs / artifacts
 out-hf-dpcs/
-checkpoints/
+checkpoint-200/
 runs/
 wandb/
 mlruns/
