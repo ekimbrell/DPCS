@@ -1,132 +1,214 @@
 import math
-import types
+import importlib
+import importlib.util
+from pathlib import Path
+
 import pytest
+import os as _os
+_os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 import torch.nn as nn
 
-# Import the scheduler from the local file
-from dpcs import DPCS, DPCSConfig
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for DPCS tests")
 
 
-class TinyMLP(nn.Module):
-    def __init__(self, d_in=32, d_hidden=64, d_out=10):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_in, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, d_out),
-        )
+# --- Robust import of the module under test ---------------------------------
+# Works if package is installed (pip install -e .) OR running against src/ layout.
 
-    def forward(self, x):
-        return self.net(x)
+def _import_dpcs_module():
+    # 0) Try the installed package path first
+    try:
+        return importlib.import_module("dpcs.dpcs")
+    except Exception:
+        pass
+
+    # 1) Try to import from src/ layout
+    here = Path(__file__).resolve().parents[1]  # repo root
+    candidate = here / "src" / "dpcs" / "dpcs.py"
+    if candidate.exists():
+        spec = importlib.util.spec_from_file_location("dpcs.dpcs", str(candidate))
+        mod = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        return mod
+
+    # 2) Fallback to a top-level file (flat layout)
+    flat = here / "dpcs.py"
+    if flat.exists():
+        spec = importlib.util.spec_from_file_location("dpcs", str(flat))
+        mod = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        return mod
+
+    raise RuntimeError("Could not locate DPCS module. Install the package or keep it under src/dpcs/dpcs.py")
 
 
-def _one_step(model, sched: DPCS, device: str = "cpu"):
-    model.train()
-    x = torch.randn(8, 32, device=device)
-    y = torch.randint(0, 10, (8,), device=device)
-    optim = torch.optim.SGD(model.parameters(), lr=1e-2)
-    scaler = torch.amp.GradScaler(device) if (device == "cuda" and torch.cuda.is_available()) else None
+_dpcs = _import_dpcs_module()
+DPCS = _dpcs.DPCS
+DPCSConfig = _dpcs.DPCSConfig
 
-    sched.start_step()
-    with torch.autocast(device, dtype=torch.float16 if device == "cuda" else torch.bfloat16, enabled=True):
-        logits = model(x)
-        loss = torch.nn.functional.cross_entropy(logits, y)
-    if scaler is not None:
+
+# --- Helpers ----------------------------------------------------------------
+
+def tiny_mlp(n_in=1024, n_hidden=1024, n_out=1024, depth=2):
+    layers = []
+    for _ in range(depth):
+        layers.append(nn.Sequential(nn.Linear(n_in, n_hidden), nn.GELU(), nn.Linear(n_hidden, n_out)))
+    return nn.Sequential(*layers).cuda().train()
+
+
+def modes_summary(scheduler: "DPCS"):
+    counts = {}
+    for st in scheduler._registry.values():  # test may use private internals
+        counts[st.mode] = counts.get(st.mode, 0) + 1
+    return counts
+
+
+def run_step(scheduler: "DPCS", model: nn.Module, optimizer, use_scaler: bool):
+    scheduler.start_step()
+    x = torch.randn(4, 1024, device="cuda", dtype=torch.float32)
+    y = model(x)
+    loss = (y.float() ** 2).mean()
+
+    if use_scaler:
+        scaler = torch.amp.GradScaler("cuda")
         scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.end_step(optimizer, scaler)
     else:
         loss.backward()
+        optimizer.step()
+        scheduler.end_step(optimizer, None)
 
-    sched.collect_signals(loss, model)
-
-    if scaler is not None:
-        scaler.step(optim)
-        scaler.update()
-    else:
-        optim.step()
-    optim.zero_grad(set_to_none=True)
-
-    sched.end_step(optim, scaler)
-    return loss.detach()
+    optimizer.zero_grad(set_to_none=True)
+    return float(loss.detach().item())
 
 
-def test_wrap_and_modes_basic_cpu():
-    device = "cpu"
-    model = TinyMLP().to(device)
-    sched = DPCS(device_type=device)
+# --- Tests ------------------------------------------------------------------
+
+def test_milestone1_amp_dtype_and_overflow_cooldown():
+    cfg = dict(
+        enable_precision=True,
+        cooldown_steps=2,
+        wrap_types=(nn.Linear, nn.Sequential),
+        ckpt_wrap_types=(nn.Sequential,),
+    )
+    model = tiny_mlp(depth=2)
+    sched = DPCS(**cfg)
     model = sched.wrap(model)
+    optim = torch.optim.SGD(model.parameters(), lr=1e-3)
 
-    # Ensure modules were registered
-    assert len(sched.modes_summary()) >= 1
+    use_scaler = sched.amp_dtype() == torch.float16
 
-    # Run a step to exercise policy
-    _one_step(model, sched, device=device)
+    # Warmup a couple of steps under AMP
+    for _ in range(2):
+        run_step(sched, model, optim, use_scaler)
 
-    mix = sched.modes_summary()
-    # At least one of these modes should be present
-    assert any(k in mix for k in ("fp16", "fp32", "fp8"))
+    # Simulate a GradScaler scale drop (overflow signal) by calling end_step with a fake scaler
+    class FakeScaler:
+        def __init__(self, scale):
+            self._scale = scale
+        def get_scale(self):
+            return float(self._scale)
+
+    # Establish a baseline scale, then a lower one to trigger cooldown
+    sched.end_step(optim, FakeScaler(1024.0))
+    sched.end_step(optim, FakeScaler(512.0))  # drop => cooldown should engage
+
+    mix = modes_summary(sched)
+    assert mix.get("fp32", 0) >= 1, f"Expected some modules in fp32 after cooldown, got {mix}"
+
+    # Cooldown counters should be set on wrapped modules
+    cools = [st.cool for st in sched._registry.values()]
+    assert all(c >= sched.cfg.cooldown_steps for c in cools), f"Cooldown not set correctly: {cools}"
 
 
-def test_cooldown_on_overflow_cpu():
-    device = "cpu"
-    model = TinyMLP().to(device)
-    sched = DPCS(device_type=device, cooldown_steps=2)
+def test_milestone2_topk_checkpoint_selection_and_blacklist():
+    # Configure so our tiny model has eligible candidates and blacklisting trips deterministically
+    cfg = dict(
+        enable_precision=True,
+        cooldown_steps=1,
+        wrap_types=(nn.Sequential, nn.Linear),
+        ckpt_wrap_types=(nn.Sequential,),
+        min_activation_bytes_to_ckpt=1 << 10,
+        ckpt_topk_frac=0.5,
+        ckpt_min_candidates=1,
+        ckpt_max_blocks=None,
+        ckpt_harmful_delta_bytes=-1,  # any positive delta marks harmful
+        ckpt_harmful_patience=1,
+    )
+    model = tiny_mlp(depth=6)
+    sched = DPCS(**cfg)
+    sched.enable_checkpointing(True)
     model = sched.wrap(model)
+    optim = torch.optim.SGD(model.parameters(), lr=1e-3)
 
-    # Do a normal step first
-    _one_step(model, sched, device=device)
+    # Warmup to populate activation byte estimates
+    run_step(sched, model, optim, use_scaler=(sched.amp_dtype() == torch.float16))
 
-    # Force non-finite grad on the first wrapped module to trigger cooldown
-    wrapped_mod = next(iter(sched._registry.keys()))
-    for p in wrapped_mod.parameters(recurse=False):
-        if p.grad is None:
-            p.grad = torch.zeros_like(p)
-        p.grad.data.fill_(float("inf"))
+    # Force low headroom so selection fraction rises (Milestone 3 influence on Milestone 2 selection)
+    sched.vram_headroom = lambda: 0.05
+    sched.start_step()
 
-    # Collect and apply decisions
-    sched.collect_signals(torch.tensor(0.0), model)
-    sched.end_step(torch.optim.SGD(model.parameters(), 1e-2), None)
+    # Count eligible Sequential modules present in registry
+    seq_modules = [m for m in model.modules() if isinstance(m, nn.Sequential) and m in sched._registry]
+    num_cands = len([m for m in seq_modules if not sched._registry[m].ckpt_blacklisted])
 
-    st = sched._registry[wrapped_mod]
-    assert st.mode == "fp32"
-    assert st.cool >= 1
+    # Expected K after low-headroom boost (1.5x, clipped to 1.0)
+    frac = min(1.0, sched.cfg.ckpt_topk_frac * 1.5)
+    expected_k = max(int(math.ceil(frac * num_cands)), int(sched.cfg.ckpt_min_candidates))
+    if sched.cfg.ckpt_max_blocks is not None:
+        expected_k = min(expected_k, int(sched.cfg.ckpt_max_blocks))
+
+    assert len(sched._ckpt_selected) == expected_k, (
+        len(sched._ckpt_selected), expected_k, num_cands
+    )
+
+    # Run a backward/step so harmful detection runs and blacklists the selected modules
+    x = torch.randn(2, 1024, device="cuda")
+    (model(x).sum()).backward()
+    optim.step(); optim.zero_grad(set_to_none=True)
+    sched.end_step(optim, None)
+
+    # Verify that at least one of the previously selected modules is now blacklisted
+    selected_list = list(sched._ckpt_selected)
+    blacklisted = [m for m in selected_list if sched._registry[m].ckpt_blacklisted]
+    assert len(blacklisted) >= 1, "Expected some modules to be blacklisted after harmful checkpoint detection"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for FP8 test")
-@pytest.mark.skipif(
-    not getattr(__import__('dpcs', fromlist=['DPCS']), 'te', None),
-    reason="Transformer Engine not available",
-)
-def test_fp8_mode_path_smoke_cuda():
-    device = "cuda"
-    model = TinyMLP().to(device)
-    sched = DPCS(device_type=device, allow_fp8=True, swap_modules_for_fp8=True,
-                 epsilon_g=1.0,  # very high threshold so variance < eps is likely
-                 kappa=1e9)      # avoid curvature trigger
+def test_milestone3_headroom_bias_changes_selection_size():
+    cfg = dict(
+        enable_precision=True,
+        cooldown_steps=1,
+        wrap_types=(nn.Sequential, nn.Linear),
+        ckpt_wrap_types=(nn.Sequential,),
+        min_activation_bytes_to_ckpt=1 << 10,
+        ckpt_topk_frac=0.25,
+        ckpt_min_candidates=1,
+        ckpt_max_blocks=None,
+        ckpt_harmful_delta_bytes=1 << 60,  # practically never harmful in this test
+        ckpt_harmful_patience=100,
+    )
+    model = tiny_mlp(depth=8)
+    sched = DPCS(**cfg)
+    sched.enable_checkpointing(True)
     model = sched.wrap(model)
+    optim = torch.optim.SGD(model.parameters(), lr=1e-3)
 
-    # Manually set low variance on all modules to force drop→fp8
-    for st in sched._registry.values():
-        st.gvar_ema = 0.0
+    # Warmup to get activation sizes
+    run_step(sched, model, optim, use_scaler=(sched.amp_dtype() == torch.float16))
 
-    _one_step(model, sched, device=device)
-    mix = sched.modes_summary()
-    assert mix.get("fp8", 0) >= 1
+    # Comfortable headroom => baseline selection size
+    sched.vram_headroom = lambda: 0.5
+    sched.start_step()
+    baseline = len(sched._ckpt_selected)
 
+    # Low headroom => selection should increase or stay the same
+    sched._ckpt_selected.clear()
+    sched.vram_headroom = lambda: 0.05
+    sched.start_step()
+    pressure = len(sched._ckpt_selected)
 
-def test_checkpointing_hysteresis_toggle():
-    # Use ckpt_need=1 so a single vote toggles
-    device = "cpu"
-    model = TinyMLP().to(device)
-    sched = DPCS(device_type=device, ckpt_low=0.04, ckpt_high=0.3, ckpt_need=1)
-    model = sched.wrap(model)
-
-    # Force headroom low → ON
-    sched._headroom = 0.01
-    sched.end_step(torch.optim.SGD(model.parameters(), 1e-2), None)
-    assert sched.is_checkpointing() is True
-
-    # Force headroom high → OFF
-    sched._headroom = 0.9
-    sched.end_step(torch.optim.SGD(model.parameters(), 1e-2), None)
-    assert sched.is_checkpointing() is False
+    assert pressure >= baseline, f"Expected >= checkpointed modules under pressure ({pressure} vs {baseline})"

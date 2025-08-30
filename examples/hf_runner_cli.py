@@ -167,7 +167,8 @@ class RunCfg:
     sdpa: Optional[str]
 
 
-def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optional[str] = None) -> dict:
+def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optional[str] = None, log_modes: bool = False) -> dict:
+
     torch.manual_seed(cfg.seed); torch.cuda.manual_seed_all(cfg.seed)
 
     # Tokenizer
@@ -180,7 +181,10 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
     train, evald = build_dataset(cfg.dataset_id, cfg.dataset_config, tok, cfg.seq_len, cfg.n_train, cfg.n_eval)
     collate = SafeCLM(tok, mlm=False)
 
+    # --- Device & AMP flags (gate by DPCS precision) ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_bf16 = bool(dpcs_precision_on and device == "cuda" and torch.cuda.is_bf16_supported())
+    use_fp16 = bool(dpcs_precision_on and device == "cuda" and not use_bf16)
 
     # Model
     model = build_model(cfg.model_id)
@@ -197,7 +201,7 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = not ckpt_on
 
-    # DPCS
+    # ---- DPCS + wrapping ----------------------------------------------------
     sdpa_backend = _sdpa_from_str(cfg.sdpa)
     sched = DPCS(
         device_type=device,
@@ -208,14 +212,15 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
         force_sdpa_in_blocks=True,
         sdpa_backends=(sdpa_backend,) if sdpa_backend is not None else (SDPBackend.MATH,) if _SDPA else ("AUTO",),
     )
+    # If the scheduler exposes a runtime toggle, honor it; otherwise the ctor flag is enough.
+    if hasattr(sched, "set_precision_enabled"):
+        sched.set_precision_enabled(bool(dpcs_precision_on))
     model = sched.wrap(model)
 
-    # AMP policy: enable mixed precision ONLY when DPCS precision is ON
-    use_fp16 = bool(dpcs_precision_on and device == "cuda")
-    use_bf16 = bool(dpcs_precision_on and device == "cuda" and not use_fp16 and torch.cuda.is_bf16_supported())
-
-    args = make_training_args(
+    # ---- Trainer args (AMP gated by DPCS precision) -------------------------
+    targs = make_training_args(
         output_dir="out-hf-dpcs",
+        overwrite_output_dir=True,
         per_device_train_batch_size=cfg.batch_size,
         per_device_eval_batch_size=cfg.batch_size,
         learning_rate=cfg.lr,
@@ -234,74 +239,120 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
 
     trainer = Trainer(
         model=model,
-        args=args,
+        args=targs,
         train_dataset=train,
         eval_dataset=evald,
         data_collator=collate,
         callbacks=[DPCSCallback(sched, model)],
     )
+    if log_modes:
+        trainer.add_callback(ModeLogger(sched, every=20))
+
 
     # measure wall + peak mem
     if device == "cuda":
-        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+        torch.cuda.empty_cache(); torch.cuda.memory.reset_peak_memory_stats(); torch.cuda.synchronize()
     t0 = time.perf_counter()
     with sdpa_kernel(sdpa_backend) if (sdpa_backend is not None) else sdpa_kernel([SDPBackend.MATH]) if _SDPA else sdpa_kernel():
         trainer.train()
-        eval_metrics = trainer.evaluate()
+        if device == "cuda":
+            torch.cuda.synchronize()
     t1 = time.perf_counter()
 
-    wall_s = t1 - t0
-    peak_bytes = int(torch.cuda.max_memory_allocated()) if device == "cuda" else 0
+    # Evaluate (not timed for throughput)
+    with sdpa_kernel(sdpa_backend) if (sdpa_backend is not None) else sdpa_kernel([SDPBackend.MATH]) if _SDPA else sdpa_kernel():
+        eval_metrics = trainer.evaluate()
 
-    # tokens per sample ≈ seq_len (causal LM)
-    steps = max(1, trainer.state.global_step)
-    seen_samples = steps * cfg.batch_size
-    samp_s = seen_samples / wall_s
-    tok_s = (seen_samples * cfg.seq_len) / wall_s
 
-    eval_loss = float(eval_metrics.get("eval_loss", float("nan")))
-    ppl = float(math.exp(eval_loss)) if math.isfinite(eval_loss) else float("nan")
+        wall_s = t1 - t0
+        peak_bytes = int(torch.cuda.memory.max_memory_allocated()) if device == "cuda" else 0
 
-    row = {
-        "run_id": f"hf-c{int(ckpt_on)}-p{int(dpcs_precision_on)}",
-        "device": device,
-        "model_id": cfg.model_id,
-        "dataset": f"{cfg.dataset_id}/{cfg.dataset_config or 'default'}",
-        "sdpa": cfg.sdpa or "auto",
-        "batch": cfg.batch_size,
-        "seq": cfg.seq_len,
-        "max_steps": cfg.max_steps,
-        "epochs": cfg.epochs,
-        "avg_ms": (wall_s / steps) * 1000.0,
-        "samp_s": samp_s,
-        "tok_s": tok_s,
-        "eval_loss": eval_loss,
-        "ppl": ppl,
-        "cuda_peak": peak_bytes,
-    }
+        # tokens per sample ≈ seq_len (causal LM)
+        steps = max(1, trainer.state.global_step)
+        seen_samples = steps * cfg.batch_size
+        samp_s = seen_samples / wall_s
+        tok_s = (seen_samples * cfg.seq_len) / wall_s
 
-    if jsonl:
-        os.makedirs(os.path.dirname(jsonl) or ".", exist_ok=True)
-        with open(jsonl, "a") as f:
-            f.write(json.dumps(row) + "\n")
+        eval_loss = float(eval_metrics.get("eval_loss", float("nan")))
+        ppl = float(math.exp(eval_loss)) if math.isfinite(eval_loss) else float("nan")
 
-    # pretty print
-    def _fmt_bytes(b):
-        if b >= (1<<30): return f"{b/(1<<30):.2f} GiB"
-        if b >= (1<<20): return f"{b/(1<<20):.2f} MiB"
-        return f"{b} B"
+        row = {
+            "run_id": f"hf-c{int(ckpt_on)}-p{int(dpcs_precision_on)}",
+            "device": device,
+            "model_id": cfg.model_id,
+            "dataset": f"{cfg.dataset_id}/{cfg.dataset_config or 'default'}",
+            "sdpa": cfg.sdpa or "auto",
+            "batch": cfg.batch_size,
+            "seq": cfg.seq_len,
+            "max_steps": cfg.max_steps,
+            "epochs": cfg.epochs,
+            "avg_ms": (wall_s / steps) * 1000.0,
+            "samp_s": samp_s,
+            "tok_s": tok_s,
+            "eval_loss": eval_loss,
+            "ppl": ppl,
+            "cuda_peak": peak_bytes,
+        }
 
-    print(
-        f"run_id {row['run_id']:<8} device {device:<4} ckpt {'Y' if ckpt_on else 'N'} "
-        f"prec {'Y' if dpcs_precision_on else 'N'} sdpa {row['sdpa']:<7} "
-        f"avg_ms {row['avg_ms']:.2f} samp/s {row['samp_s']:.2f} tok/s {row['tok_s']:.2f} "
-        f"eval_loss {row['eval_loss']:.4f} cuda_peak {_fmt_bytes(peak_bytes)}"
-    )
+        if jsonl:
+            os.makedirs(os.path.dirname(jsonl) or ".", exist_ok=True)
+            with open(jsonl, "a") as f:
+                f.write(json.dumps(row) + "\n")
 
-    return row
+        # pretty print
+        def _fmt_bytes(b):
+            if b >= (1<<30): return f"{b/(1<<30):.2f} GiB"
+            if b >= (1<<20): return f"{b/(1<<20):.2f} MiB"
+            return f"{b} B"
+
+        print(
+            f"run_id {row['run_id']:<8} device {device:<4} ckpt {'Y' if ckpt_on else 'N'} "
+            f"prec {'Y' if dpcs_precision_on else 'N'} sdpa {row['sdpa']:<7} "
+            f"avg_ms {row['avg_ms']:.2f} samp/s {row['samp_s']:.2f} tok/s {row['tok_s']:.2f} "
+            f"eval_loss {row['eval_loss']:.4f} cuda_peak {_fmt_bytes(peak_bytes)}"
+        )
+
+        return row
 
 
 # ---- CLI --------------------------------------------------------------------
+
+import shutil
+def _maybe_clean(jsonl_path: Optional[str], out_dir: str, clean: bool):
+    if not clean:
+        return
+    try:
+        if jsonl_path and os.path.exists(jsonl_path):
+            os.remove(jsonl_path)
+            print(f"[hf_runner_cli] removed {jsonl_path}")
+    except Exception as e:
+        print(f"[hf_runner_cli] warn: failed to remove {jsonl_path}: {e}")
+    try:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        print(f"[hf_runner_cli] removed {out_dir}/")
+    except Exception as e:
+        print(f"[hf_runner_cli] warn: failed to remove {out_dir}: {e}")
+from transformers import TrainerCallback
+
+def _mode_hist(sched) -> dict:
+    # Build a {mode: count} histogram from the DPCS registry
+    hist = {}
+    reg = getattr(sched, "_registry", {})
+    for st in reg.values():
+        hist[st.mode] = hist.get(st.mode, 0) + 1
+    return hist
+
+class ModeLogger(TrainerCallback):
+    def __init__(self, sched, every: int = 20):
+        self.sched = sched
+        self.every = max(1, int(every))
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.every == 0:
+            headroom = getattr(self.sched, "vram_headroom", lambda: None)()
+            ckpts = len(getattr(self.sched, "_ckpt_selected", []))
+            hist = _mode_hist(self.sched)
+            print(f"[modes] step {state.global_step:>5} hist {hist} ckpt_selected {ckpts} headroom {headroom:.3f}" if headroom is not None else f"[modes] step {state.global_step:>5} hist {hist} ckpt_selected {ckpts}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -319,6 +370,9 @@ def main():
     ap.add_argument("--sdpa", default="math", choices=["auto","math","efficient","flash"], help="Scaled-dot attention backend")
     ap.add_argument("--jsonl", default=None)
     ap.add_argument("--grid", action="store_true", help="Run the 2x2 grid: (ckpt ∈ {0,1})×(precision ∈ {0,1})")
+    ap.add_argument("--log-modes", action="store_true", help="Print DPCS mode histogram/ckpt count every N steps")
+    ap.add_argument("--clean", action="store_true", help="Delete output_dir and --jsonl before running")
+
 
     # --- Auto summarize options ----------------------------------------------
     ap.add_argument("--summarize", action="store_true", help="After --grid, auto-run summarize_jsonl.py on the JSONL")
@@ -344,12 +398,16 @@ def main():
         sdpa=args.sdpa,
     )
 
+    _maybe_clean(args.jsonl, "out-hf-dpcs", args.clean)
+
+
     if not args.grid:
-        run_once(cfg, ckpt_on=False, dpcs_precision_on=True, jsonl=args.jsonl)
+        run_once(cfg, ckpt_on=False, dpcs_precision_on=True, jsonl=args.jsonl, log_modes=args.log_modes)
     else:
         combos = [ (False, False), (False, True), (True, False), (True, True) ]
         for ck, pr in combos:
-            run_once(cfg, ckpt_on=ck, dpcs_precision_on=pr, jsonl=args.jsonl)
+            run_once(cfg, ckpt_on=ck, dpcs_precision_on=pr, jsonl=args.jsonl, log_modes=args.log_modes)
+
 
         # auto-summarize
         if args.summarize and args.jsonl:

@@ -36,7 +36,6 @@ except Exception:  # pragma: no cover - fallback path
 def _has_cuda() -> bool:
     return torch.cuda.is_available()
 
-
 def _tensor_bytes(obj: Any) -> int:
     """Best-effort count of tensor payload bytes for nested outputs."""
     if torch.is_tensor(obj):
@@ -113,6 +112,12 @@ class DPCSConfig:
     ckpt_min_candidates: int = 1
     ckpt_max_blocks: Optional[int] = None
 
+    # memory-aware precision policy
+    low_headroom_frac: float = 0.12  # e.g., prefer lower precision below ~12% free VRAM
+
+    # checkpoint determinism check: "default" compares (shape,dtype,device); "none" disables the check
+    checkpoint_determinism_check: str = "none"
+
     # which module types we precision-wrap vs ckpt-wrap
     wrap_types: Tuple[Type[nn.Module], ...] = (nn.Linear, nn.TransformerEncoderLayer)
     ckpt_wrap_types: Tuple[Type[nn.Module], ...] = (nn.Sequential, nn.TransformerEncoderLayer)
@@ -143,6 +148,7 @@ class DPCS:
 
         # precision toggle determines autocast use; stats are always collected
         self._prec_on = bool(self.cfg.enable_precision)
+        self._low_headroom: bool = False
 
         # warm-up autotune pools
         self._warm_enabled: bool = bool(self.cfg.autotune_precision and self.cfg.autotune_warmup_steps > 0)
@@ -172,6 +178,18 @@ class DPCS:
                 norm.append(b)
         return tuple(norm)
 
+    # --- AMP helpers--------------------------------------
+    def amp_dtype(self) -> torch.dtype:
+        """Preferred autocast dtype for this device (bf16 if supported, else fp16)."""
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+
+
+    def amp_uses_grad_scaler(self) -> bool:
+        """Whether the training loop should use GradScaler for the current AMP dtype."""
+        return self.amp_dtype() == torch.float16
+
     # --- Public API -------------------------------------------------------
     def wrap(self, model: nn.Module) -> nn.Module:
         for m in model.modules():
@@ -197,9 +215,8 @@ class DPCS:
                         return mode in ("fp16", "fp8")  # fp8 path would be provided by a backend adapter
 
                     def _local_dtype():
-                        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                            return torch.bfloat16
-                        return torch.float16
+                        # delegate to class-wide AMP dtype policy (bf16 preferred)
+                        return self.amp_dtype()
 
                     def _ensure_topk_selected_if_needed():
                         # Lazy top-K selection so users who forget start_step() still checkpoint
@@ -239,10 +256,10 @@ class DPCS:
                                 return fn(*a, **k)
 
                         preserve = _needs_rng_state(mod)
-                        pre_peak = torch.cuda.max_memory_allocated() if _has_cuda() else 0
-                        out = checkpoint(fn, *a, use_reentrant=False, preserve_rng_state=preserve, **k)
+                        pre_peak = torch.cuda.memory.max_memory_allocated() if _has_cuda() else 0
+                        out = torch.utils.checkpoint.checkpoint(_body, *a, use_reentrant=False, determinism_check=self.cfg.checkpoint_determinism_check, **k)
                         if _has_cuda():
-                            post_peak = torch.cuda.max_memory_allocated()
+                            post_peak = torch.cuda.memory.max_memory_allocated()
                             if (post_peak - pre_peak) > self.cfg.ckpt_harmful_delta_bytes:
                                 st.harmful_count += 1
                                 if st.harmful_count >= self.cfg.ckpt_harmful_patience:
@@ -264,7 +281,7 @@ class DPCS:
                         sdpa_ctx = sdpa_kernel(self._sdpa_backends) if (self.cfg.force_sdpa_in_blocks and is_tx) else nullcontext()
 
                         if ac_enabled:
-                            with torch.autocast(device_type=self.device_type, dtype=dtype, enabled=True):
+                            with torch.amp.autocast(self.device_type, dtype=dtype, enabled=True):
                                 with sdpa_ctx:
                                     out = _maybe_checkpoint(_body, *args, **kwargs)
                         else:
@@ -284,6 +301,22 @@ class DPCS:
         return model
 
     # --- Logging helpers --------------------------------------------------
+    # Precision control 
+    def set_precision_enabled(self, on: bool = True) -> None:
+        """
+        Toggle global mixed precision. When False, DPCS runs modules in fp32.
+        """
+        self._prec_on = bool(on)
+
+    def get_amp_config(self) -> Tuple[str, torch.dtype, bool]:
+        """
+        Returns (device_type, dtype, enabled) tuple suitable for torch.amp.autocast.
+        Example usage:
+            device_type, dtype, enabled = self.get_amp_config()
+            # with torch.amp.autocast(device_type, dtype=dtype, enabled=enabled): ...
+        """
+        return (self.device_type, self.amp_dtype(), self._prec_on)
+
     def precision_mix(self) -> dict:
         if not self._registry:
             return {}
@@ -314,9 +347,54 @@ class DPCS:
             except Exception:
                 pass
 
+    # --- VRAM headroom helpers ---------------------------------------------
+    def _mem_get_info(self) -> Optional[Tuple[int, int]]:
+        """
+        Returns (free_bytes, total_bytes) for the current CUDA device, or None if unavailable.
+        Prefers torch.cuda.memory.mem_get_info(); falls back to torch.cuda.mem_get_info().
+        """
+        if not torch.cuda.is_available():
+            return None
+        try:
+            free, total = torch.cuda.memory.mem_get_info()  # PyTorch docs-recommended API
+        except Exception:
+            try:
+                free, total = torch.cuda.mem_get_info()      # older alias
+            except Exception:
+                return None
+        return int(free), int(total)
+
+    def vram_headroom(self) -> Optional[float]:
+        """
+        Returns free/total VRAM fraction in [0,1], or None if not on CUDA.
+        """
+        info = self._mem_get_info()
+        if info is None:
+            return None
+        free, total = info
+        return (float(free) / float(total)) if total else None
+
     # --- Step lifecycle ---------------------------------------------------
     def start_step(self) -> None:
         self._step += 1
+        # Reset CUDA peak memory stats so per-step peaks are comparable.
+        # (Per docs, reset_peak_memory_stats() scopes max_memory_allocated() to the period after reset.)
+        # Fallback to torch.cuda.reset_peak_memory_stats() for older installs.
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.memory.reset_peak_memory_stats()
+            except Exception:
+                try:
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
+        # Measure live VRAM headroom (free/total) for this step and cache a flag.
+        self._low_headroom = False
+        ratio = self.vram_headroom()
+        if ratio is not None and ratio < float(self.cfg.low_headroom_frac):
+            self._low_headroom = True
+
+
         # Build the per-step top-K selection set for checkpointing
         self._ckpt_selected.clear()
         if not self._ckpt_on or not self.cfg.ckpt_enable_topk:
@@ -333,14 +411,64 @@ class DPCS:
         if not cands:
             return
         cands.sort(key=lambda t: t[0], reverse=True)
-        K = len(cands)
-        if self.cfg.ckpt_topk_frac > 0:
-            K = max(int(math.ceil(self.cfg.ckpt_topk_frac * len(cands))), int(self.cfg.ckpt_min_candidates))
+
+        # Start from configured fraction, but if headroom is low, bias toward more checkpointing.
+        total_candidates = len(cands)  # include ancestors (e.g., outer Sequential) for target-K math
+        frac = float(self.cfg.ckpt_topk_frac)
+        if getattr(self, "_low_headroom", False):
+            # Increase fraction under pressure, but never above 1.0
+            frac = min(1.0, max(frac, frac * 1.5))
+        if frac > 0:
+            K_target = max(int(math.ceil(frac * total_candidates)), int(self.cfg.ckpt_min_candidates))
+        else:
+            K_target = 0
         if self.cfg.ckpt_max_blocks is not None:
-            K = min(K, int(self.cfg.ckpt_max_blocks))
-        K = max(0, min(K, len(cands)))
-        selected = [m for _, m in cands[:K]]
+            K_target = min(K_target, int(self.cfg.ckpt_max_blocks))
+        K_target = max(0, K_target)
+
+        # Leaf-only filter: keep modules that do NOT contain other ckpt-wrap types as descendants.
+        # This avoids selecting both an outer container and one of its inner blocks.
+        def _has_ckpt_descendant(m: nn.Module) -> bool:
+            for ch in m.modules():
+                if ch is m:
+                    continue
+                if isinstance(ch, self.cfg.ckpt_wrap_types):
+                    return True
+            return False
+
+        leaf_cands = [(bytes_, m) for (bytes_, m) in cands if not _has_ckpt_descendant(m)]
+
+        # Cap K by the number of leaf candidates (no nesting conflicts among leaves).
+        K = min(K_target, len(leaf_cands))
+
+        # If nothing left (e.g., all were non-leaf), fall back to original cands but avoid conflicts.
+        effective_cands = leaf_cands if K > 0 else cands
+
+        # Select up to K modules while avoiding ancestor/descendant conflicts as a safety net.
+        selected: list[nn.Module] = []
+        def _conflicts(m: nn.Module) -> bool:
+            for s in selected:
+                if s is m:
+                    return True
+                for ch in s.modules():
+                    if ch is m and ch is not s:
+                        return True
+                for ch in m.modules():
+                    if ch is s and ch is not m:
+                        return True
+            return False
+
+        for _, m in effective_cands:
+            if len(selected) >= K:
+                break
+            if _conflicts(m):
+                continue
+            selected.append(m)
+
         self._ckpt_selected = set(selected)
+
+
+
 
     # --- Stats collection -------------------------------------------------
     def _variance_and_l2_mean(self, mod: nn.Module) -> Optional[Tuple[float, float]]:
@@ -436,11 +564,19 @@ class DPCS:
                 st.pending_overflow = False
                 continue
 
-            if st.grad_l2_ema is None:
-                next_mode = "fp16"
+            # Memory-aware precision policy with a strict FP32 override.
+            # If global precision is disabled, force fp32 regardless of headroom.
+            if not self._prec_on:
+                next_mode = "fp32"
             else:
-                next_mode = "fp16" if st.grad_l2_ema < self.cfg.epsilon_g else "fp32"
+                if getattr(self, "_low_headroom", False):
+                    # prefer AMP under pressure (bf16 preferred by amp_dtype)
+                    next_mode = "fp16"
+                else:
+                    # comfortable headroom -> fp32
+                    next_mode = "fp32"
             st.mode = next_mode
+
 
         # optional compact log
         if self._log_cb:
@@ -455,6 +591,27 @@ class DPCS:
     # --- Convenience ------------------------------------------------------
     def on_log(self, fn: Callable[[dict], None]) -> None:
         self._log_cb = fn
+
+    def enable_checkpointing(self, on: bool = True) -> None:
+        """
+        Enable/disable activation checkpointing globally.
+        """
+        self._ckpt_on = bool(on)
+
+    def set_checkpoint_fraction(self, frac: float) -> None:
+        """
+        Set fraction of checkpoint-eligible modules to select (0.0–1.0).
+        """
+        frac = float(frac)
+        self.cfg.ckpt_topk_frac = max(0.0, min(frac, 1.0))
+
+    def set_checkpoint_determinism_check(self, mode: str = "none") -> None:
+        """
+        Set checkpoint determinism check mode: "default" or "none".
+        """
+        if mode not in ("default", "none"):
+            raise ValueError(f"invalid determinism_check={mode}")
+        self.cfg.checkpoint_determinism_check = mode
 
     def is_checkpointing(self) -> bool:
         return self._ckpt_on

@@ -19,7 +19,7 @@ signals = ["backpack-for-pytorch"]      # Variance / diag-GGN (optional). :conte
 dev = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/yourname/dpcs"
+Homepage = "https://github.com/ekimbrell/dpcs"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
