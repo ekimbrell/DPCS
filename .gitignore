@@ -20,15 +20,7 @@ out-hf-dpcs/# training outputs / artifacts
 out-hf-dpcs/
 checkpoint-200/
 runs/
-wandb/
-mlruns/
-*.pt
-*.bin
-*.safetensors
-*.ckpt
-*.onnx
-*.npz
-*.npy
+
 .cache/
 datasets/
 data/

@@ -1,156 +1,152 @@
-#!/usr/bin/env python
-"""
-Hugging Face training CLI to evaluate DPCS on a real LM task.
-Runs a 2x2 grid: (HF gradient checkpointing on/off) x (DPCS precision on/off),
-logs per-run JSONL with throughput, peak CUDA memory, and eval loss/perplexity.
+"""Hugging Face training CLI to evaluate DPCS on a real LM task (rewritten).
 
-Fixes in this version:
-  - Packs CLM data with the standard group_texts (fixed block_size) to avoid zero-length sequences
-  - Filters empty tokenized examples before packing
-  - Disables model.config.use_cache when gradient checkpointing is enabled
-  - AMP is enabled *only* when DPCS precision is ON
-  - SafeCLM collator enforces integer dtypes for ids/labels/masks
-  - Version-agnostic TrainingArguments (evaluation_strategy ⇄ eval_strategy)
+Key changes from your original draft:
+- **Manual training loop** (no HF Trainer) so DPCS can control **precision per step**
+  and toggle checkpointing without fighting Trainer internals.
+- **Fair baselines**: choose static AMP via `--amp {off,fp16,bf16}` independently of
+  `--dpcs-precision` (which enables DPCS' adaptive precision policy).
+- **No double-ckpt**: if `--ckpt` (HF gradient checkpointing) is on, DPCS leaf-ckpt
+  is disabled to avoid double recompute cost.
+- **Throughput timing excludes eval**; eval runs after training, separately.
+- **Robust dataset loader**: auto-detects text column, tokenizes without truncation,
+  packs to fixed blocks, drops empty examples, and uses a safe LM collator.
+- **SDPA**: uses `sdpa_kernel([backend])` (list form) and falls back cleanly.
+- **JSONL logging** of wall-time, samp/s, tok/s, eval loss/ppl, CUDA peak bytes.
 
-Example:
+Example (single run):
+  python examples/hf_runner_cli.py \
+    --model EleutherAI/pythia-160m --dataset Salesforce/wikitext --dataset-config wikitext-2-raw-v1 \
+    --seq 512 --train-samples 5000 --eval-samples 1000 --batch 2 --max-steps 200 \
+    --sdpa math --amp bf16 --ckpt 0 --dpcs-precision 1 --jsonl runs.jsonl
+
+Grid (2x2 over HF-ckpt x DPCS-precision):
   python examples/hf_runner_cli.py --grid --jsonl runs.jsonl --summarize \
     --model EleutherAI/pythia-160m --dataset Salesforce/wikitext --dataset-config wikitext-2-raw-v1 \
-    --max-steps 200 --batch 2 --seq 512 --sdpa math
-
-You can later scale with Accelerate/DDP:
-  accelerate launch --num_processes 2 examples/hf_runner_cli.py ...
+    --seq 512 --train-samples 5000 --eval-samples 1000 --batch 2 --max-steps 200 --sdpa math --amp bf16
 """
 from __future__ import annotations
-import argparse, json, math, os, time, sys, subprocess, inspect
+
+import argparse, json, math, os, sys, time, subprocess, shutil
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
+
+# --- Make the src/ package importable when running from examples/ ---
+_THIS_DIR = os.path.dirname(__file__)
+_SRC_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "src"))
+if _SRC_ROOT not in sys.path:
+    sys.path.insert(0, _SRC_ROOT)
 
 import torch
+from torch.utils.data import DataLoader
 
 from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, Trainer,
-    DataCollatorForLanguageModeling, TrainerCallback, TrainerControl, TrainerState
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import get_linear_schedule_with_warmup
+from contextlib import nullcontext
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-from dpcs import DPCS
+# DPCS (our package)
+from dpcs import DPCS, DPCSConfig
 
-# ---- version-agnostic TrainingArguments helper ------------------------------
-
-def make_training_args(**kwargs):
-    from transformers import TrainingArguments
-    sig = inspect.signature(TrainingArguments.__init__)
-    has_eval_strategy = "eval_strategy" in sig.parameters
-    has_evaluation_strategy = "evaluation_strategy" in sig.parameters
-
-    if has_eval_strategy and not has_evaluation_strategy:
-        if "evaluation_strategy" in kwargs:
-            kwargs["eval_strategy"] = kwargs.pop("evaluation_strategy")
-    elif has_evaluation_strategy and not has_eval_strategy:
-        if "eval_strategy" in kwargs:
-            kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
-    return TrainingArguments(**kwargs)
-
-
-# ---- SDPA helpers (portable) -------------------------------------------------
+# ---- SDPA helpers (portable) ----------------------------------------------
 try:
     from torch.nn.attention import sdpa_kernel, SDPBackend
-    _SDPA = True
+    _HAVE_SDPA = True
 except Exception:  # pragma: no cover
-    _SDPA = False
+    _HAVE_SDPA = False
     from contextlib import contextmanager
     @contextmanager
     def sdpa_kernel(*_a, **_k):
         yield
-    class SDPBackend:
+    class SDPBackend:  # type: ignore
         MATH = "MATH"; EFFICIENT_ATTENTION = "EFFICIENT_ATTENTION"; FLASH_ATTENTION = "FLASH_ATTENTION"
 
-
-def _sdpa_from_str(name: str):
-    name = (name or "auto").lower()
-    if not _SDPA or name == "auto":
+def sdpa_from_str(name: str | None):
+    if not name or not _HAVE_SDPA:
         return None
-    if name == "math":
-        return SDPBackend.MATH
-    if name in ("eff", "efficient"):
-        return SDPBackend.EFFICIENT_ATTENTION
-    if name in ("flash", "flash_attention"):
-        return SDPBackend.FLASH_ATTENTION
-    raise ValueError(f"Unknown sdpa backend: {name}")
+    s = name.lower()
+    if s == "math": return SDPBackend.MATH
+    if s in ("efficient", "eff"): return SDPBackend.EFFICIENT_ATTENTION
+    if s in ("flash", "flash_attention"): return SDPBackend.FLASH_ATTENTION
+    if s == "auto": return None
+    raise ValueError(f"unknown sdpa backend: {name}")
 
+# ---- Data / tokenization ---------------------------------------------------
 
-# ---- Data/model builders -----------------------------------------------------
+def _guess_text_col(split) -> str:
+    # Prefer common names, else first string column
+    prefs = {"text", "content", "document"}
+    for c in split.column_names:
+        if c.lower() in prefs:
+            return c
+    for c in split.column_names:
+        val = split[c][0]
+        if isinstance(val, str):
+            return c
+    raise ValueError("No text-like column found in dataset")
+
 
 def build_dataset(dataset_id: str, dataset_config: Optional[str], tokenizer, seq_len: int,
                   n_train: int, n_eval: int):
     ds = load_dataset(dataset_id, dataset_config)
+    text_col = _guess_text_col(ds["train"]) if "train" in ds else _guess_text_col(ds["validation"])  # heuristic
 
-    # Tokenize without truncation; we'll pack to fixed blocks below
-    text_col_names = ds["train"].column_names
     def tok_fn(batch):
-        return tokenizer(batch["text"], return_attention_mask=False, truncation=False)
+        return tokenizer(batch[text_col], return_attention_mask=False, truncation=False)
 
-    ds = ds.map(tok_fn, batched=True, remove_columns=text_col_names)
+    remove_cols = ds["train"].column_names if "train" in ds else None
+    ds = ds.map(tok_fn, batched=True, remove_columns=remove_cols)
 
-    # Drop empties defensively
+    # Drop empty tokenized samples
     ds = ds.filter(lambda ex: len(ex["input_ids"]) > 0)
 
-    block_size = int(seq_len)
+    block = int(seq_len)
     def group_texts(examples):
-        # Concatenate lists of tokens and split by block_size
         concatenated = []
         for ids in examples["input_ids"]:
             concatenated.extend(ids)
-        total_length = (len(concatenated) // block_size) * block_size
-        if total_length == 0:
+        total_len = (len(concatenated) // block) * block
+        if total_len == 0:
             return {"input_ids": [], "labels": []}
-        chunks = [concatenated[i:i + block_size] for i in range(0, total_length, block_size)]
+        chunks = [concatenated[i:i+block] for i in range(0, total_len, block)]
         return {"input_ids": chunks, "labels": [c[:] for c in chunks]}
 
     ds = ds.map(group_texts, batched=True)
 
-    # Slice to requested sizes
     train = ds["train"].select(range(min(n_train, len(ds["train"]))))
-    evald = (ds["validation"] if "validation" in ds else ds["test"]) \
-        .select(range(min(n_eval, len(ds["validation"]) if "validation" in ds else len(ds["test"]))))
-
+    eval_split = ds["validation"] if "validation" in ds else ds["test"]
+    evald = eval_split.select(range(min(n_eval, len(eval_split))))
     return train, evald
 
 
-def build_model(model_id: str):
-    return AutoModelForCausalLM.from_pretrained(model_id)
-
-
-# ---- Safe collator to enforce integer dtypes --------------------------------
-class SafeCLM(DataCollatorForLanguageModeling):
+class SafeCLM:
+    """Minimal collator enforcing correct integer dtypes for LM."""
+    def __init__(self, tokenizer):
+        self.pad_token_id = tokenizer.pad_token_id
     def __call__(self, features):
-        batch = super().__call__(features)
-        # Enforce integral types for indices/labels
-        if "input_ids" in batch and batch["input_ids"].dtype not in (torch.int64, torch.int32):
-            batch["input_ids"] = batch["input_ids"].to(torch.long)
-        if "labels" in batch and batch["labels"].dtype not in (torch.int64, torch.int32):
-            batch["labels"] = batch["labels"].to(torch.long)
-        if "attention_mask" in batch and batch["attention_mask"].dtype not in (torch.int64, torch.int32, torch.bool):
-            batch["attention_mask"] = batch["attention_mask"].to(torch.long)
-        return batch
+        # features is list of {input_ids, labels}
+        max_len = max(len(f["input_ids"]) for f in features)
+        def pad(seq):
+            return seq + [self.pad_token_id] * (max_len - len(seq))
+        inps = torch.tensor([pad(f["input_ids"]) for f in features], dtype=torch.long)
+        labs = torch.tensor([pad(f["labels"]) for f in features], dtype=torch.long)
+        return {"input_ids": inps, "labels": labs}
 
+# ---- AMP helpers -----------------------------------------------------------
 
-# ---- DPCS ↔ Trainer glue ----------------------------------------------------
-class DPCSCallback(TrainerCallback):
-    def __init__(self, sched: DPCS, model: torch.nn.Module):
-        self.sched = sched
-        self.model = model
-    def on_step_begin(self, args, state: TrainerState, control: TrainerControl, **kw):
-        self.sched._ckpt_on = bool(getattr(args, "gradient_checkpointing", False))
-        self.sched.start_step()
-    def on_backward_end(self, args, state, control, **kw):
-        loss = kw.get("loss")
-        self.sched.collect_signals(loss, self.model)
-    def on_optimizer_step(self, args, state, control, **kw):
-        self.sched.end_step(kw.get("optimizer"), scaler=None)
+def amp_from_flag(flag: str, device: str) -> Tuple[str, torch.dtype | None, bool]:
+    """Return (device_type, dtype, enabled) for static AMP choice."""
+    if device != "cuda":
+        return device, None, False
+    s = flag.lower()
+    if s == "bf16" and torch.cuda.is_bf16_supported():
+        return "cuda", torch.bfloat16, True
+    if s == "fp16":
+        return "cuda", torch.float16, True
+    return "cuda", None, False  # off / unsupported
 
+# ---- Run config ------------------------------------------------------------
 
-# ---- Runner -----------------------------------------------------------------
 @dataclass
 class RunCfg:
     model_id: str
@@ -164,160 +160,185 @@ class RunCfg:
     max_steps: int
     epochs: int
     seed: int
-    sdpa: Optional[str]
+    sdpa: str
+    amp: str  # off|fp16|bf16
 
+# ---- Single run ------------------------------------------------------------
 
-def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optional[str] = None, log_modes: bool = False) -> dict:
+def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optional[str] = None) -> dict:
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
 
-    torch.manual_seed(cfg.seed); torch.cuda.manual_seed_all(cfg.seed)
-
-    # Tokenizer
-    tok = AutoTokenizer.from_pretrained(cfg.model_id, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    # Be explicit about max length to keep padding/clipping consistent
-    tok.model_max_length = cfg.seq_len
-
-    train, evald = build_dataset(cfg.dataset_id, cfg.dataset_config, tok, cfg.seq_len, cfg.n_train, cfg.n_eval)
-    collate = SafeCLM(tok, mlm=False)
-
-    # --- Device & AMP flags (gate by DPCS precision) ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    use_bf16 = bool(dpcs_precision_on and device == "cuda" and torch.cuda.is_bf16_supported())
-    use_fp16 = bool(dpcs_precision_on and device == "cuda" and not use_bf16)
+
+    # Tokenizer & data
+    tok = AutoTokenizer.from_pretrained(cfg.model_id, use_fast=True)
+    if tok.pad_token is None:  # ensure pad exists
+        tok.pad_token = tok.eos_token
+    tok.model_max_length = 1_000_000
+
+    train_ds, eval_ds = build_dataset(cfg.dataset_id, cfg.dataset_config, tok, cfg.seq_len, cfg.n_train, cfg.n_eval)
+    collate = SafeCLM(tok)
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                              num_workers=2, pin_memory=(device=="cuda"), drop_last=True, collate_fn=collate)
+    eval_loader = DataLoader(eval_ds, batch_size=cfg.batch_size, shuffle=False,
+                             num_workers=2, pin_memory=(device=="cuda"), drop_last=False, collate_fn=collate)
 
     # Model
-    model = build_model(cfg.model_id)
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_id)
+    model.to(device)
+    model.train()
 
-    # HF gradient checkpointing as the ckpt dimension
-    if ckpt_on:
-        if hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable()
-    else:
-        if hasattr(model, "gradient_checkpointing_disable"):
-            model.gradient_checkpointing_disable()
-
-    # Disable KV cache when using checkpointing (HF recommendation)
+    # HF gradient checkpointing (dimension of the grid); disable DPCS leaf-ckpt when HF ckpt is on
+    if ckpt_on and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    elif hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = not ckpt_on
 
-    # ---- DPCS + wrapping ----------------------------------------------------
-    sdpa_backend = _sdpa_from_str(cfg.sdpa)
-    sched = DPCS(
+    # Optimizer & LR schedule (simple AdamW + linear warmup)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    total_steps = cfg.max_steps if cfg.max_steps > 0 else (cfg.epochs * max(1, len(train_loader)))
+    warmup = max(0, int(0.06 * total_steps))
+    sched = get_linear_schedule_with_warmup(opt, num_warmup_steps=warmup, num_training_steps=total_steps)
+
+    # DPCS scheduler (adaptive precision + optional leaf ckpt)
+    sdpa_backend = sdpa_from_str(cfg.sdpa)
+    dpcs_kwargs = dict(
         device_type=device,
         enable_precision=bool(dpcs_precision_on),
-        autotune_precision=True,
-        autotune_warmup_steps=50,
-        wrap_types=(torch.nn.Linear, torch.nn.TransformerEncoderLayer),
-        force_sdpa_in_blocks=True,
-        sdpa_backends=(sdpa_backend,) if sdpa_backend is not None else (SDPBackend.MATH,) if _SDPA else ("AUTO",),
+        curv_period=0,  # turn off curvature probes for clean throughput
+        ckpt_topk_frac=0.2 if not ckpt_on else 0.0,  # avoid double-ckpt when HF ckpt active
+        min_activation_bytes_to_ckpt=1<<21,  # ignore very small activations
     )
-    # If the scheduler exposes a runtime toggle, honor it; otherwise the ctor flag is enough.
-    if hasattr(sched, "set_precision_enabled"):
-        sched.set_precision_enabled(bool(dpcs_precision_on))
-    model = sched.wrap(model)
+    dpcs = DPCS(**DPCSConfig.from_kwargs(**dpcs_kwargs).to_kwargs())
+    model = dpcs.wrap(model)
 
-    # ---- Trainer args (AMP gated by DPCS precision) -------------------------
-    targs = make_training_args(
-        output_dir="out-hf-dpcs",
-        overwrite_output_dir=True,
-        per_device_train_batch_size=cfg.batch_size,
-        per_device_eval_batch_size=cfg.batch_size,
-        learning_rate=cfg.lr,
-        num_train_epochs=cfg.epochs,
-        max_steps=cfg.max_steps if cfg.max_steps > 0 else None,
-        fp16=use_fp16,
-        bf16=use_bf16,
-        gradient_checkpointing=ckpt_on,
-        logging_steps=10,
-        evaluation_strategy="steps",
-        eval_steps=max(50, min(200, cfg.n_train // cfg.batch_size)),
-        save_steps=0,
-        report_to="none",
-        dataloader_drop_last=True,
-    )
+    dpcs.set_log_jsonl("out-hf-dpcs/dpcs.jsonl")
 
-    trainer = Trainer(
-        model=model,
-        args=targs,
-        train_dataset=train,
-        eval_dataset=evald,
-        data_collator=collate,
-        callbacks=[DPCSCallback(sched, model)],
-    )
-    if log_modes:
-        trainer.add_callback(ModeLogger(sched, every=20))
+    
+    # AMP mode (static baseline when DPCS precision is OFF)
+    static_dev, static_dtype, static_enabled = amp_from_flag(cfg.amp, device)
 
+    # Use a GradScaler only when DPCS requests fp16 *this* step
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
-    # measure wall + peak mem
+    # SDPA context
+    sdpa_ctx = (lambda: sdpa_kernel([sdpa_backend])) if (sdpa_backend is not None) else \
+               (lambda: sdpa_kernel([SDPBackend.MATH])) if _HAVE_SDPA else (lambda: sdpa_kernel())
+
+    # ---- Train (measure only train time) ----
     if device == "cuda":
         torch.cuda.empty_cache(); torch.cuda.memory.reset_peak_memory_stats(); torch.cuda.synchronize()
     t0 = time.perf_counter()
-    with sdpa_kernel(sdpa_backend) if (sdpa_backend is not None) else sdpa_kernel([SDPBackend.MATH]) if _SDPA else sdpa_kernel():
-        trainer.train()
-        if device == "cuda":
-            torch.cuda.synchronize()
+
+    steps_done = 0
+    model.train()
+    for epoch in range(max(1, cfg.epochs)):
+        for batch in train_loader:
+            if cfg.max_steps and steps_done >= cfg.max_steps:
+                break
+            dpcs.start_step()
+            inputs = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+            # choose AMP per step
+            if dpcs_precision_on:
+                dev, dtype, enabled = dpcs.get_amp_config()
+            else:
+                dev, dtype, enabled = static_dev, static_dtype, static_enabled
+
+            amp_ctx = torch.amp.autocast("cuda", dtype=dtype, enabled=enabled) if device == "cuda" else nullcontext()
+            with sdpa_ctx():
+                with amp_ctx:
+                    out = model(**inputs)
+                    loss = out.loss
+
+            opt.zero_grad(set_to_none=True)
+            use_scaler = enabled and (dtype is torch.float16)
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
+            sched.step()
+
+            dpcs.end_step(opt, scaler if use_scaler else None)
+            steps_done += 1
+        if cfg.max_steps and steps_done >= cfg.max_steps:
+            break
+
+    if device == "cuda":
+        torch.cuda.synchronize()
     t1 = time.perf_counter()
 
-    # Evaluate (not timed for throughput)
-    with sdpa_kernel(sdpa_backend) if (sdpa_backend is not None) else sdpa_kernel([SDPBackend.MATH]) if _SDPA else sdpa_kernel():
-        eval_metrics = trainer.evaluate()
+    # ---- Eval (not included in throughput timing) ----
+    model.eval()
+    eval_loss_sum, eval_tokens = 0.0, 0
+    with torch.no_grad():
+        for batch in eval_loader:
+            inputs = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            eval_amp_ctx = torch.amp.autocast("cuda", dtype=static_dtype, enabled=static_enabled) if device == "cuda" else nullcontext()
+            with sdpa_ctx():
+                with eval_amp_ctx:
+                    out = model(**inputs)
+                    loss = out.loss
+            eval_loss_sum += float(loss.detach().cpu()) * inputs["input_ids"].size(0)
+            eval_tokens += inputs["input_ids"].numel()
+    eval_loss = eval_loss_sum / max(1, len(eval_loader.dataset))
+    ppl = math.exp(eval_loss) if math.isfinite(eval_loss) else float("nan")
 
+    # ---- Metrics & logging ----
+    wall_s = (t1 - t0)
+    steps = max(1, steps_done)
+    seen_samples = steps * cfg.batch_size
+    samp_s = seen_samples / wall_s
+    tok_s = (seen_samples * cfg.seq_len) / wall_s
+    peak_bytes = int(torch.cuda.memory.max_memory_allocated()) if device == "cuda" else 0
 
-        wall_s = t1 - t0
-        peak_bytes = int(torch.cuda.memory.max_memory_allocated()) if device == "cuda" else 0
+    row = {
+        "run_id": f"hf-c{int(ckpt_on)}-p{int(dpcs_precision_on)}",
+        "device": device,
+        "model_id": cfg.model_id,
+        "dataset": f"{cfg.dataset_id}/{cfg.dataset_config or 'default'}",
+        "sdpa": cfg.sdpa,
+        "amp": cfg.amp,
+        "batch": cfg.batch_size,
+        "seq": cfg.seq_len,
+        "max_steps": cfg.max_steps,
+        "epochs": cfg.epochs,
+        "avg_ms": (wall_s / steps) * 1000.0,
+        "samp_s": samp_s,
+        "tok_s": tok_s,
+        "eval_loss": eval_loss,
+        "ppl": ppl,
+        "cuda_peak": peak_bytes,
+    }
 
-        # tokens per sample ≈ seq_len (causal LM)
-        steps = max(1, trainer.state.global_step)
-        seen_samples = steps * cfg.batch_size
-        samp_s = seen_samples / wall_s
-        tok_s = (seen_samples * cfg.seq_len) / wall_s
+    if jsonl:
+        os.makedirs(os.path.dirname(jsonl) or ".", exist_ok=True)
+        with open(jsonl, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
 
-        eval_loss = float(eval_metrics.get("eval_loss", float("nan")))
-        ppl = float(math.exp(eval_loss)) if math.isfinite(eval_loss) else float("nan")
+    def _fmt_bytes(b):
+        if b >= (1<<30): return f"{b/(1<<30):.2f} GiB"
+        if b >= (1<<20): return f"{b/(1<<20):.2f} MiB"
+        return f"{b} B"
+    print(
+        f"run_id {row['run_id']:<8} device {device:<4} ckpt {'Y' if ckpt_on else 'N'} "
+        f"dpcs_prec {'Y' if dpcs_precision_on else 'N'} sdpa {row['sdpa']:<7} amp {row['amp']:<4} "
+        f"avg_ms {row['avg_ms']:.2f} samp/s {row['samp_s']:.2f} tok/s {row['tok_s']:.2f} "
+        f"eval_loss {row['eval_loss']:.4f} cuda_peak {_fmt_bytes(peak_bytes)}"
+    )
 
-        row = {
-            "run_id": f"hf-c{int(ckpt_on)}-p{int(dpcs_precision_on)}",
-            "device": device,
-            "model_id": cfg.model_id,
-            "dataset": f"{cfg.dataset_id}/{cfg.dataset_config or 'default'}",
-            "sdpa": cfg.sdpa or "auto",
-            "batch": cfg.batch_size,
-            "seq": cfg.seq_len,
-            "max_steps": cfg.max_steps,
-            "epochs": cfg.epochs,
-            "avg_ms": (wall_s / steps) * 1000.0,
-            "samp_s": samp_s,
-            "tok_s": tok_s,
-            "eval_loss": eval_loss,
-            "ppl": ppl,
-            "cuda_peak": peak_bytes,
-        }
+    return row
 
-        if jsonl:
-            os.makedirs(os.path.dirname(jsonl) or ".", exist_ok=True)
-            with open(jsonl, "a") as f:
-                f.write(json.dumps(row) + "\n")
+# ---- CLI -------------------------------------------------------------------
 
-        # pretty print
-        def _fmt_bytes(b):
-            if b >= (1<<30): return f"{b/(1<<30):.2f} GiB"
-            if b >= (1<<20): return f"{b/(1<<20):.2f} MiB"
-            return f"{b} B"
-
-        print(
-            f"run_id {row['run_id']:<8} device {device:<4} ckpt {'Y' if ckpt_on else 'N'} "
-            f"prec {'Y' if dpcs_precision_on else 'N'} sdpa {row['sdpa']:<7} "
-            f"avg_ms {row['avg_ms']:.2f} samp/s {row['samp_s']:.2f} tok/s {row['tok_s']:.2f} "
-            f"eval_loss {row['eval_loss']:.4f} cuda_peak {_fmt_bytes(peak_bytes)}"
-        )
-
-        return row
-
-
-# ---- CLI --------------------------------------------------------------------
-
-import shutil
 def _maybe_clean(jsonl_path: Optional[str], out_dir: str, clean: bool):
     if not clean:
         return
@@ -332,26 +353,6 @@ def _maybe_clean(jsonl_path: Optional[str], out_dir: str, clean: bool):
         print(f"[hf_runner_cli] removed {out_dir}/")
     except Exception as e:
         print(f"[hf_runner_cli] warn: failed to remove {out_dir}: {e}")
-from transformers import TrainerCallback
-
-def _mode_hist(sched) -> dict:
-    # Build a {mode: count} histogram from the DPCS registry
-    hist = {}
-    reg = getattr(sched, "_registry", {})
-    for st in reg.values():
-        hist[st.mode] = hist.get(st.mode, 0) + 1
-    return hist
-
-class ModeLogger(TrainerCallback):
-    def __init__(self, sched, every: int = 20):
-        self.sched = sched
-        self.every = max(1, int(every))
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.every == 0:
-            headroom = getattr(self.sched, "vram_headroom", lambda: None)()
-            ckpts = len(getattr(self.sched, "_ckpt_selected", []))
-            hist = _mode_hist(self.sched)
-            print(f"[modes] step {state.global_step:>5} hist {hist} ckpt_selected {ckpts} headroom {headroom:.3f}" if headroom is not None else f"[modes] step {state.global_step:>5} hist {hist} ckpt_selected {ckpts}")
 
 
 def main():
@@ -368,16 +369,17 @@ def main():
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--sdpa", default="math", choices=["auto","math","efficient","flash"], help="Scaled-dot attention backend")
+    ap.add_argument("--amp", default="bf16", choices=["off","fp16","bf16"], help="Static AMP baseline (used when --dpcs-precision=0)")
     ap.add_argument("--jsonl", default=None)
-    ap.add_argument("--grid", action="store_true", help="Run the 2x2 grid: (ckpt ∈ {0,1})×(precision ∈ {0,1})")
-    ap.add_argument("--log-modes", action="store_true", help="Print DPCS mode histogram/ckpt count every N steps")
+    ap.add_argument("--grid", action="store_true", help="Run the 2x2 grid: (ckpt ∈ {0,1})×(DPCS precision ∈ {0,1})")
+    ap.add_argument("--ckpt", type=int, default=0, help="HF gradient checkpointing on(1)/off(0) for single-run mode")
+    ap.add_argument("--dpcs-precision", type=int, default=1, help="Enable DPCS adaptive precision policy")
     ap.add_argument("--clean", action="store_true", help="Delete output_dir and --jsonl before running")
 
-
-    # --- Auto summarize options ----------------------------------------------
-    ap.add_argument("--summarize", action="store_true", help="After --grid, auto-run summarize_jsonl.py on the JSONL")
+    # Auto-summarize helpers (optional external script)
+    ap.add_argument("--summarize", action="store_true")
     ap.add_argument("--summary-baseline", default="hf-c0-p0")
-    ap.add_argument("--summary-sort", default="avg_ms", choices=["avg_ms","samp_s","tok_s","cuda_peak","eval_loss","ppl"])
+    ap.add_argument("--summary-sort", default="avg_ms", choices=["avg_ms","samp_s","tok_s","cuda_peak","eval_loss","ppl"]) 
     ap.add_argument("--summary-desc", action="store_true")
     ap.add_argument("--summary-csv", default=None)
 
@@ -396,20 +398,18 @@ def main():
         epochs=args.epochs,
         seed=args.seed,
         sdpa=args.sdpa,
+        amp=args.amp,
     )
 
     _maybe_clean(args.jsonl, "out-hf-dpcs", args.clean)
 
-
     if not args.grid:
-        run_once(cfg, ckpt_on=False, dpcs_precision_on=True, jsonl=args.jsonl, log_modes=args.log_modes)
+        run_once(cfg, ckpt_on=bool(args.ckpt), dpcs_precision_on=bool(args.dpcs_precision), jsonl=args.jsonl)
     else:
-        combos = [ (False, False), (False, True), (True, False), (True, True) ]
+        combos = [(0,0),(0,1),(1,0),(1,1)]
         for ck, pr in combos:
-            run_once(cfg, ckpt_on=ck, dpcs_precision_on=pr, jsonl=args.jsonl, log_modes=args.log_modes)
-
-
-        # auto-summarize
+            run_once(cfg, ckpt_on=bool(ck), dpcs_precision_on=bool(pr), jsonl=args.jsonl)
+        # optional external summarize script (kept for parity with your workflow)
         if args.summarize and args.jsonl:
             summ = os.path.join(os.path.dirname(__file__), "summarize_jsonl.py")
             cmd = [sys.executable, summ, args.jsonl,
@@ -419,14 +419,12 @@ def main():
                 cmd.append("--desc")
             if args.summary_csv:
                 cmd += ["--csv", args.summary_csv]
-            # helpful filters to isolate current experiment rows
             cmd += ["--filter-model", args.model, "--filter-dataset", args.dataset_config]
             print(f"[hf_runner_cli] summarizing with: {' '.join(cmd)}")
             try:
                 subprocess.run(cmd, check=False)
             except Exception as e:
                 print(f"[hf_runner_cli] summarize failed: {e}")
-
 
 if __name__ == "__main__":
     main()
