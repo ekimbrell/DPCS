@@ -197,7 +197,7 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
     elif hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-        model.config.use_cache = not ckpt_on
+        model.config.use_cache = False
 
     # Optimizer & LR schedule (simple AdamW + linear warmup)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
@@ -219,7 +219,7 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
 
     dpcs.set_log_jsonl("out-hf-dpcs/dpcs.jsonl")
 
-    
+
     # AMP mode (static baseline when DPCS precision is OFF)
     static_dev, static_dtype, static_enabled = amp_from_flag(cfg.amp, device)
 
@@ -231,8 +231,18 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
                (lambda: sdpa_kernel([SDPBackend.MATH])) if _HAVE_SDPA else (lambda: sdpa_kernel())
 
     # ---- Train (measure only train time) ----
+    cuda_total_bytes = None
+    cuda_min_free_bytes = None
     if device == "cuda":
-        torch.cuda.empty_cache(); torch.cuda.memory.reset_peak_memory_stats(); torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.memory.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        # Track the smallest observed free VRAM so we can report a physical
+        # peak instead of PyTorch's virtual allocation counter (which may count
+        # Unified Memory spillover and therefore exceed the device capacity).
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        cuda_total_bytes = int(total_bytes)
+        cuda_min_free_bytes = int(free_bytes)
     t0 = time.perf_counter()
 
     steps_done = 0
@@ -268,6 +278,14 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
             sched.step()
 
             dpcs.end_step(opt, scaler if use_scaler else None)
+
+
+            if device == "cuda" and cuda_min_free_bytes is not None:
+                # `mem_get_info` reflects the current free physical memory on the
+                # device. Track the minimum to estimate a physical peak usage.
+                free_bytes, _ = torch.cuda.mem_get_info()
+                cuda_min_free_bytes = min(cuda_min_free_bytes, int(free_bytes))
+
             steps_done += 1
         if cfg.max_steps and steps_done >= cfg.max_steps:
             break
@@ -298,7 +316,14 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
     seen_samples = steps * cfg.batch_size
     samp_s = seen_samples / wall_s
     tok_s = (seen_samples * cfg.seq_len) / wall_s
-    peak_bytes = int(torch.cuda.memory.max_memory_allocated()) if device == "cuda" else 0
+    peak_alloc_bytes = int(torch.cuda.memory.max_memory_allocated()) if device == "cuda" else 0
+    peak_bytes = peak_alloc_bytes
+    oversub_bytes = 0
+    if device == "cuda" and cuda_total_bytes is not None:
+        peak_bytes = min(peak_alloc_bytes, cuda_total_bytes)
+        if cuda_min_free_bytes is not None:
+            peak_bytes = min(peak_bytes, cuda_total_bytes - cuda_min_free_bytes)
+        oversub_bytes = max(0, peak_alloc_bytes - cuda_total_bytes)
 
     row = {
         "run_id": f"hf-c{int(ckpt_on)}-p{int(dpcs_precision_on)}",
@@ -319,6 +344,10 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
         "cuda_peak": peak_bytes,
     }
 
+    if device == "cuda":
+        row["cuda_peak_alloc"] = peak_alloc_bytes
+        row["cuda_oversub"] = oversub_bytes
+
     if jsonl:
         os.makedirs(os.path.dirname(jsonl) or ".", exist_ok=True)
         with open(jsonl, "a", encoding="utf-8") as f:
@@ -328,12 +357,14 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
         if b >= (1<<30): return f"{b/(1<<30):.2f} GiB"
         if b >= (1<<20): return f"{b/(1<<20):.2f} MiB"
         return f"{b} B"
+    extra = ""
+    if device == "cuda" and oversub_bytes:
+        extra = f" (virt {_fmt_bytes(peak_alloc_bytes)}; oversub {_fmt_bytes(oversub_bytes)})"
     print(
         f"run_id {row['run_id']:<8} device {device:<4} ckpt {'Y' if ckpt_on else 'N'} "
         f"dpcs_prec {'Y' if dpcs_precision_on else 'N'} sdpa {row['sdpa']:<7} amp {row['amp']:<4} "
         f"avg_ms {row['avg_ms']:.2f} samp/s {row['samp_s']:.2f} tok/s {row['tok_s']:.2f} "
-        f"eval_loss {row['eval_loss']:.4f} cuda_peak {_fmt_bytes(peak_bytes)}"
-    )
+        f"eval_loss {row['eval_loss']:.4f} cuda_peak {_fmt_bytes(peak_bytes)}{extra}")
 
     return row
 

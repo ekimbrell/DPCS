@@ -86,6 +86,10 @@ class PrecisionPolicy:
         self.bf16_supported = bool(bf16_supported)
         self.cooldown = 0
         self.pat = _Patience(enter=max(1, cfg.mode_patience), exit=max(1, cfg.mode_patience))
+        # When an overflow triggers a forced fp32 interval we keep track of it so
+        # we can immediately return to a lower mode once conditions are safe
+        # again (e.g., low headroom or tame gradients).
+        self._force_fp32_until_safe = False
 
     def _lower_mode(self) -> str:
         # prefer bf16 on CUDA-capable platforms; else fp16; else fp32
@@ -104,6 +108,7 @@ class PrecisionPolicy:
         # 1) Overflow → force fp32 for a cooldown window
         if overflow:
             self.cooldown = max(self.cooldown, 8)
+            self._force_fp32_until_safe = True
             return "fp32"
 
         if self.cooldown > 0:
@@ -114,9 +119,34 @@ class PrecisionPolicy:
         hr = _clamp01(headroom)
         gv = 0.0 if (grad_var is None) else float(grad_var)
         curv = 0.0 if (curvature is None) else float(curvature)
+        low_headroom = hr < self.cfg.low_headroom_frac
+        safe_signals = (
+            (grad_var is None or gv <= self.cfg.epsilon_g_low)
+            and (curvature is None or curv <= self.cfg.kappa_low)
+        )
 
-        want_low = (hr < self.cfg.low_headroom_frac) or (gv < self.cfg.epsilon_g_low and curv < self.cfg.kappa_low)
+
+        want_low = low_headroom or (gv < self.cfg.epsilon_g_low and curv < self.cfg.kappa_low)
         want_high = (hr > self.cfg.hi_headroom_frac) or (gv > self.cfg.epsilon_g_high or curv > self.cfg.kappa_high)
+
+        if self._force_fp32_until_safe:
+            if low_headroom or safe_signals:
+                # Drop back to the preferred lower mode immediately after the
+                # overflow-induced cooldown finishes. Also reset patience so the
+                # lower mode sticks unless high-pressure signals appear.
+                self._force_fp32_until_safe = False
+                self.pat.state = True
+                self.pat.cnt = 0
+                return self._lower_mode()
+            if want_high and not want_low:
+                # If we are seeing strong signals to remain in higher precision
+                # stop treating the current fp32 mode as overflow-forced.
+                self._force_fp32_until_safe = False
+                return "fp32"
+            # Otherwise keep the current mode (typically fp32) until safety
+            # conditions are met.
+            return current
+
 
         # 3) Apply hysteresis: if neither strongly wants change, keep current
         if want_low and not want_high:

@@ -201,9 +201,57 @@ class DPCS:
                 # Allow training to continue if the current step cannot build HVP
                 pass
 
+    def _sync_min_headroom(self, headroom: Optional[float]) -> Optional[float]:
+        """Synchronize headroom across ranks via distributed MIN reduce."""
+        if headroom is None or self.cfg.device_type != "cuda":
+            return headroom
+
+        dist = getattr(torch, "distributed", None)
+        if dist is None:
+            return headroom
+
+        is_available = getattr(dist, "is_available", None)
+        try:
+            if not callable(is_available) or not is_available():
+                return headroom
+        except Exception:
+            return headroom
+
+        is_initialized = getattr(dist, "is_initialized", None)
+        try:
+            if not callable(is_initialized) or not is_initialized():
+                return headroom
+        except Exception:
+            return headroom
+
+        reduce_op = getattr(dist, "ReduceOp", None)
+        if reduce_op is None or not hasattr(reduce_op, "MIN"):
+            return headroom
+
+        try:
+            device = torch.device(self.cfg.device_type)
+        except Exception:
+            device = torch.device("cpu")
+
+        try:
+            tensor = torch.tensor([float(headroom)], device=device)
+        except Exception:
+            tensor = torch.tensor([float(headroom)], device=torch.device("cpu"))
+
+        try:
+            dist.all_reduce(tensor, op=reduce_op.MIN)
+        except Exception:
+            return headroom
+
+        try:
+            return float(tensor.item())
+        except Exception:
+            return headroom
+
     def end_step(self, optim: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None) -> None:
         # 1) Read memory headroom
         hr = headroom_frac()
+        hr = self._sync_min_headroom(hr)
         free_b, total_b = 0, 1
         info = mem_get_info()
         
