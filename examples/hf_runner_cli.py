@@ -5,8 +5,10 @@ Key changes from your original draft:
   and toggle checkpointing without fighting Trainer internals.
 - **Fair baselines**: choose static AMP via `--amp {off,fp16,bf16}` independently of
   `--dpcs-precision` (which enables DPCS' adaptive precision policy).
-- **No double-ckpt**: if `--ckpt` (HF gradient checkpointing) is on, DPCS leaf-ckpt
-  is disabled to avoid double recompute cost.
+- **Independent checkpoint toggles**: `--ckpt` only controls Hugging Face gradient
+  checkpointing; DPCS leaf checkpointing stays at the fraction requested via
+  `--dpcs-ckpt-topk-frac` (default 0 disables it) so you can stack or isolate the
+  mechanisms explicitly.
 - **Throughput timing excludes eval**; eval runs after training, separately.
 - **Robust dataset loader**: auto-detects text column, tokenizes without truncation,
   packs to fixed blocks, drops empty examples, and uses a safe LM collator.
@@ -162,6 +164,9 @@ class RunCfg:
     seed: int
     sdpa: str
     amp: str  # off|fp16|bf16
+    dpcs_ckpt_topk_frac: float
+    dpcs_epsilon_g_low: float
+    dpcs_epsilon_g_high: float
 
 # ---- Single run ------------------------------------------------------------
 
@@ -191,7 +196,7 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
     model.to(device)
     model.train()
 
-    # HF gradient checkpointing (dimension of the grid); disable DPCS leaf-ckpt when HF ckpt is on
+    # HF gradient checkpointing (dimension of the grid)
     if ckpt_on and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     elif hasattr(model, "gradient_checkpointing_disable"):
@@ -207,12 +212,16 @@ def run_once(cfg: RunCfg, ckpt_on: bool, dpcs_precision_on: bool, jsonl: Optiona
 
     # DPCS scheduler (adaptive precision + optional leaf ckpt)
     sdpa_backend = sdpa_from_str(cfg.sdpa)
+    ckpt_frac = float(cfg.dpcs_ckpt_topk_frac)
+
     dpcs_kwargs = dict(
         device_type=device,
         enable_precision=bool(dpcs_precision_on),
         curv_period=0,  # turn off curvature probes for clean throughput
-        ckpt_topk_frac=0.2 if not ckpt_on else 0.0,  # avoid double-ckpt when HF ckpt active
+        ckpt_topk_frac=ckpt_frac,
         min_activation_bytes_to_ckpt=1<<21,  # ignore very small activations
+        epsilon_g_low=cfg.dpcs_epsilon_g_low,
+        epsilon_g_high=cfg.dpcs_epsilon_g_high,
     )
     dpcs = DPCS(**DPCSConfig.from_kwargs(**dpcs_kwargs).to_kwargs())
     model = dpcs.wrap(model)
@@ -405,6 +414,12 @@ def main():
     ap.add_argument("--grid", action="store_true", help="Run the 2x2 grid: (ckpt ∈ {0,1})×(DPCS precision ∈ {0,1})")
     ap.add_argument("--ckpt", type=int, default=0, help="HF gradient checkpointing on(1)/off(0) for single-run mode")
     ap.add_argument("--dpcs-precision", type=int, default=1, help="Enable DPCS adaptive precision policy")
+    ap.add_argument("--dpcs-ckpt-topk-frac", type=float, default=0.0,
+                    help="Fraction of heaviest leaves DPCS checkpoints (0 disables)")
+    ap.add_argument("--dpcs-epsilon-g-low", type=float, default=5e-4,
+                    help="Gradient-variance threshold to drop precision (smaller => more fp32)")
+    ap.add_argument("--dpcs-epsilon-g-high", type=float, default=2e-3,
+                    help="Gradient-variance threshold to raise precision")
     ap.add_argument("--clean", action="store_true", help="Delete output_dir and --jsonl before running")
 
     # Auto-summarize helpers (optional external script)
@@ -430,6 +445,9 @@ def main():
         seed=args.seed,
         sdpa=args.sdpa,
         amp=args.amp,
+        dpcs_ckpt_topk_frac=args.dpcs_ckpt_topk_frac,
+        dpcs_epsilon_g_low=args.dpcs_epsilon_g_low,
+        dpcs_epsilon_g_high=args.dpcs_epsilon_g_high,
     )
 
     _maybe_clean(args.jsonl, "out-hf-dpcs", args.clean)
