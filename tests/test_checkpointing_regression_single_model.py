@@ -28,8 +28,7 @@ class DeepMLP(nn.Module):
 
 
 def _force_fp32_modes(sched: DPCS):
-    for st in sched._registry.values():
-        st.mode = "fp32"
+    sched.force_fp32()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for memory regression check")
