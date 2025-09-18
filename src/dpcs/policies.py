@@ -71,8 +71,9 @@ class _Patience:
 class PrecisionPolicy:
     """Finite-state policy for AMP mode selection.
 
-    Modes: "fp32", "bf16", "fp16". (FP8 is handled by a separate runtime if
-    available; here we only decide the autocast dtype.)
+    Modes: "fp32", "bf16", "fp16", optionally "fp8" when supported by the
+    runtime helper. The policy still governs the global precision mode
+    while the runtime swaps FP8-capable modules when requested.
 
     Signals considered:
       - ``headroom``: free/total VRAM fraction (0..1). Low headroom → lower precision.
@@ -81,9 +82,10 @@ class PrecisionPolicy:
       - ``overflow``: GradScaler overflow → immediate fp32 cooldown.
     """
 
-    def __init__(self, cfg: DPCSConfig, bf16_supported: bool) -> None:
+    def __init__(self, cfg: DPCSConfig, bf16_supported: bool, fp8_supported: bool = False) -> None:
         self.cfg = cfg
         self.bf16_supported = bool(bf16_supported)
+        self.fp8_supported = bool(fp8_supported)
         self.cooldown = 0
         self.pat = _Patience(enter=max(1, cfg.mode_patience), exit=max(1, cfg.mode_patience))
         # When an overflow triggers a forced fp32 interval we keep track of it so
@@ -92,10 +94,28 @@ class PrecisionPolicy:
         self._force_fp32_until_safe = False
 
     def _lower_mode(self) -> str:
-        # prefer bf16 on CUDA-capable platforms; else fp16; else fp32
+        # prefer fp8 when available, then bf16, else fp16
+        if self.fp8_supported:
+            return "fp8"
         if self.bf16_supported:
             return "bf16"
         return "fp16"
+
+    def _promote_mode(self, current: str) -> str:
+        if current == "fp32":
+            return "fp32"
+        if current == "fp8":
+            if self.bf16_supported:
+                return "bf16"
+            return "fp32"
+        if current == "bf16":
+            return "fp32"
+        if current == "fp16":
+            return "fp32"
+        return "fp32"
+
+    def update_fp8_support(self, supported: bool) -> None:
+        self.fp8_supported = bool(supported)
 
     def decide(
         self,
@@ -154,13 +174,7 @@ class PrecisionPolicy:
             target = self._lower_mode()
         elif want_high and not want_low:
             self.pat.update(False)
-            # promote: bf16→fp32 or fp16→bf16/fp32 depending on support
-            if current == "fp32":
-                target = "fp32"
-            elif self.bf16_supported:
-                target = "bf16"
-            else:
-                target = "fp32"
+            target = self._promote_mode(current)
         else:
             # ambiguous; keep current
             return current

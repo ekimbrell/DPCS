@@ -20,7 +20,7 @@ All helpers gracefully degrade on older PyTorch versions.
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 import os
 import time
 
@@ -39,6 +39,17 @@ except Exception:  # pragma: no cover
         yield
     class SDPBackend:  # type: ignore[override]
         MATH = "MATH"; EFFICIENT_ATTENTION = "EFFICIENT_ATTENTION"; FLASH_ATTENTION = "FLASH_ATTENTION"
+
+try:  # pragma: no cover - optional dependency
+    import transformer_engine.pytorch as _te
+    from transformer_engine.common import recipe as _te_recipe
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager as _FP8GSM
+    _HAVE_TE = True
+except Exception:  # pragma: no cover
+    _te = None  # type: ignore[assignment]
+    _te_recipe = None  # type: ignore[assignment]
+    _FP8GSM = None  # type: ignore[assignment]
+    _HAVE_TE = False
 
 # AMP helpers -----------------------------------------------------------------
 
@@ -97,6 +108,105 @@ def sdpa_context(force: bool, backends: Iterable[Any]):
     if not force:
         return nullcontext()
     return sdpa_kernel(sdpa_backends_normalize(backends))
+
+# TransformerEngine FP8 helpers ----------------------------------------------
+
+def _te_fp8_supported() -> bool:
+    if not (_HAVE_TE and torch.cuda.is_available() and _FP8GSM is not None):
+        return False
+    try:
+        ok, _ = _FP8GSM.is_fp8_available()
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _te_make_recipe(margin: int, amax_history_len: int):
+    if not (_HAVE_TE and _te_recipe is not None):
+        return None
+    try:
+        margin_i = max(0, int(margin))
+        hist_i = max(1, int(amax_history_len))
+        return _te_recipe.DelayedScaling(margin=margin_i, amax_history_len=hist_i)
+    except Exception:
+        return None
+
+
+def _te_linear_from_torch(module: nn.Linear) -> Optional[nn.Module]:
+    if not _te_fp8_supported():
+        return None
+    try:
+        weight = module.weight
+    except AttributeError:
+        return None
+    if weight is None or not isinstance(weight, torch.Tensor):
+        return None
+    device = weight.device
+    if device.type != "cuda":
+        return None
+    bias = getattr(module, "bias", None)
+    try:
+        te_linear = _te.Linear(
+            module.in_features,
+            module.out_features,
+            bias=(bias is not None),
+            params_dtype=weight.dtype,
+            device=device,
+        )
+    except Exception:
+        return None
+    try:
+        state = module.state_dict()
+        te_linear.load_state_dict(state, strict=False)
+    except Exception:
+        with torch.no_grad():
+            te_linear.weight.copy_(weight)
+            if bias is not None and hasattr(te_linear, "bias"):
+                te_linear.bias.copy_(bias)
+    te_linear.train(module.training)
+    return te_linear
+
+
+def _te_convert_module(module: nn.Module) -> Optional[nn.Module]:
+    if isinstance(module, nn.Linear):
+        return _te_linear_from_torch(module)
+    return None
+
+
+def te_prepare_fp8_modules(
+    modules: Iterable[nn.Module],
+    *,
+    margin: int,
+    amax_history_len: int,
+) -> Tuple[Optional[Any], Dict[int, nn.Module]]:
+    """Return (recipe, replacements) for modules convertible to TransformerEngine."""
+
+    modules = list(modules)
+    if not modules:
+        return (None, {})
+    recipe = _te_make_recipe(margin, amax_history_len)
+    replacements: Dict[int, nn.Module] = {}
+    if recipe is None:
+        return (None, replacements)
+    for mod in modules:
+        new_mod = _te_convert_module(mod)
+        if new_mod is not None:
+            replacements[id(mod)] = new_mod
+    if not replacements:
+        return (None, {})
+    return (recipe, replacements)
+
+
+def te_fp8_autocast(enabled: bool, recipe: Optional[Any] = None):
+    if not (_HAVE_TE and enabled):
+        return nullcontext()
+    kwargs = {"enabled": True}
+    if recipe is not None:
+        kwargs["fp8_recipe"] = recipe
+    try:
+        return _te.fp8_autocast(**kwargs)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover
+        return nullcontext()
 
 # Memory helpers --------------------------------------------------------------
 
@@ -211,6 +321,8 @@ __all__ = [
     "amp_uses_grad_scaler",
     "sdpa_backends_normalize",
     "sdpa_context",
+    "te_prepare_fp8_modules",
+    "te_fp8_autocast",
     "reset_peak_memory_stats",
     "max_memory_allocated",
     "mem_get_info",

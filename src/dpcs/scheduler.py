@@ -32,6 +32,8 @@ from .runtime import (
     mem_get_info,
     headroom_frac,
     checkpoint_call,
+    te_prepare_fp8_modules,
+    te_fp8_autocast,
 )
 
 # ------------------------ checkpointable leaf wrapper -----------------------
@@ -48,6 +50,9 @@ class _CkptWrap(nn.Module):
         self.use_ckpt: bool = False
         self._act_bytes: int = 0
         self._t_ema = EMA(beta=0.9)
+        self._fp8_ready: bool = False
+        self._fp8_active: bool = False
+        self._fp8_recipe: Optional[Any] = None
         if torch.cuda.is_available():
             self._ev_s = torch.cuda.Event(enable_timing=True)
             self._ev_e = torch.cuda.Event(enable_timing=True)
@@ -55,15 +60,26 @@ class _CkptWrap(nn.Module):
             self._ev_s = None  # type: ignore
             self._ev_e = None  # type: ignore
 
+    def set_fp8_support(self, recipe: Optional[Any]) -> None:
+        self._fp8_ready = recipe is not None
+        self._fp8_recipe = recipe if self._fp8_ready else None
+        if not self._fp8_ready:
+            self._fp8_active = False
+
+    def set_fp8_active(self, active: bool) -> None:
+        self._fp8_active = bool(active and self._fp8_ready)
+
     def forward(self, *args, **kwargs):  # type: ignore[override]
         # timing start
         if self._ev_s is not None:
             self._ev_s.record()
         t0 = time.perf_counter()
-        if self.use_ckpt:
-            out = checkpoint_call(self.mod, *args, **kwargs)
-        else:
-            out = self.mod(*args, **kwargs)
+        ctx = te_fp8_autocast(self._fp8_active, self._fp8_recipe)
+        with ctx:
+            if self.use_ckpt:
+                out = checkpoint_call(self.mod, *args, **kwargs)
+            else:
+                out = self.mod(*args, **kwargs)
         # activation bytes and elapsed
         self._act_bytes = tensor_bytes(out)
         if self._ev_e is not None and self._ev_s is not None:
@@ -120,12 +136,28 @@ class DPCS:
         self.cfg = DPCSConfig.from_kwargs(**kwargs)
         self._step = 0
 
-        # AMP mode string: "fp32" | "bf16" | "fp16"
+        # AMP mode string: "fp32" | "bf16" | "fp16" (with optional fp8 runtime wiring)
+        self._amp_preferred_dtype = amp_preferred_dtype(self.cfg.device_type)
         if self.cfg.device_type == "cuda" and torch.cuda.is_available():
-            self._amp_mode = "bf16" if (amp_preferred_dtype("cuda") is torch.bfloat16) else "fp16"
+            if self._amp_preferred_dtype is torch.bfloat16:
+                self._amp_mode = "bf16"
+            elif self._amp_preferred_dtype is torch.float16:
+                self._amp_mode = "fp16"
+            else:
+                self._amp_mode = "fp16"
         else:
             self._amp_mode = "fp32"
         self._amp_cooldown = 0
+
+        # FP8 runtime state
+        self._fp8_supported = False
+        self._fp8_wrappers: List[_CkptWrap] = []
+        self._te_recipe: Optional[Any] = None
+        self._te_margin = max(0, int(self.cfg.te_margin_init))
+        self._te_margin_min = self._te_margin
+        self._te_margin_inc = max(0, int(self.cfg.te_margin_inc))
+        self._te_margin_dec = max(0, int(self.cfg.te_margin_dec))
+        self._te_margin_max = max(self._te_margin_min + 32, self._te_margin_min + 4 * max(1, self._te_margin_inc))
 
         # Leaves and signals
         self._model: Optional[nn.Module] = None
@@ -134,7 +166,12 @@ class DPCS:
         self._curv: Optional[CurvatureSignals] = None
 
         # Policies
-        self._prec_pol = PrecisionPolicy(self.cfg, bf16_supported=(amp_preferred_dtype("cuda") is torch.bfloat16))
+        bf16_supported = (
+            self.cfg.device_type == "cuda"
+            and torch.cuda.is_available()
+            and self._amp_preferred_dtype is torch.bfloat16
+        )
+        self._prec_pol = PrecisionPolicy(self.cfg, bf16_supported=bf16_supported, fp8_supported=False)
         self._ckpt_pol = CheckpointPolicy(self.cfg)
 
         # Overflow tracking
@@ -150,6 +187,44 @@ class DPCS:
         model, leaves = _wrap_leaves(model)
         self._model = model
         self._leaves = leaves
+
+        # Optional TransformerEngine swap for FP8
+        self._fp8_supported = False
+        self._fp8_wrappers = []
+        self._te_recipe = None
+        self._te_margin = self._te_margin_min
+        if self.cfg.device_type == "cuda" and torch.cuda.is_available() and leaves:
+            recipe, replacements = te_prepare_fp8_modules(
+                (w.mod for w in leaves),
+                margin=self.cfg.te_margin_init,
+                amax_history_len=self.cfg.te_amax_history_len,
+            )
+            if recipe is not None and replacements:
+                self._te_recipe = recipe
+                self._fp8_supported = True
+                try:
+                    recipe.margin = int(self._te_margin)
+                except Exception:
+                    pass
+                for w in leaves:
+                    orig = w.mod
+                    repl = replacements.get(id(orig))
+                    if repl is not None:
+                        repl.train(orig.training)
+                        w.mod = repl
+                        w.set_fp8_support(self._te_recipe)
+                    else:
+                        w.set_fp8_support(None)
+                self._fp8_wrappers = [w for w in leaves if w._fp8_ready]
+            else:
+                for w in leaves:
+                    w.set_fp8_support(None)
+        else:
+            for w in leaves:
+                w.set_fp8_support(None)
+        for w in leaves:
+            w.set_fp8_active(False)
+        self._prec_pol.update_fp8_support(self._fp8_supported)
 
         # Attach gradient hooks (per-parameter) aggregated per leaf
         self._grads = GradSignals(leaves, sample_max_elems=4096, beta=0.9)
@@ -176,7 +251,12 @@ class DPCS:
         device_type = self.cfg.device_type
         if device_type != "cuda" or not torch.cuda.is_available():
             return (device_type, torch.float32, False)
-        if self._amp_mode == "bf16" and (amp_preferred_dtype("cuda") is torch.bfloat16):
+        if self._amp_mode == "fp8":
+            dtype = self._amp_preferred_dtype
+            if dtype not in (torch.bfloat16, torch.float16):
+                dtype = torch.float16
+            return ("cuda", dtype, True)
+        if self._amp_mode == "bf16" and self._amp_preferred_dtype is torch.bfloat16:
             return ("cuda", torch.bfloat16, True)
         if self._amp_mode == "fp16":
             return ("cuda", torch.float16, True)
@@ -191,6 +271,16 @@ class DPCS:
         reset_peak_memory_stats()
         # Decay blacklist counters for ckpt policy
         self._ckpt_pol.tick()
+
+        # Sync TransformerEngine recipe margin and toggle FP8 activation
+        if self._te_recipe is not None:
+            try:
+                self._te_recipe.margin = int(self._te_margin)
+            except Exception:
+                pass
+        fp8_active = self._fp8_supported and self._amp_mode == "fp8"
+        for w in self._fp8_wrappers:
+            w.set_fp8_active(fp8_active)
 
     def collect_signals(self, loss: Optional[torch.Tensor], model: Optional[nn.Module] = None) -> None:
         # Optional curvature probe on schedule (requires loss with graph)
@@ -276,8 +366,17 @@ class DPCS:
             vals = [x for x in self._curv.kappa if x is not None]
             if vals:
                 curv_avg = float(sum(vals) / len(vals))
-        new_mode = self._prec_pol.decide(hr, gvar, curv_avg, overflow, self._amp_mode)
+        prev_mode = self._amp_mode
+        new_mode = self._prec_pol.decide(hr, gvar, curv_avg, overflow, prev_mode)
+        if new_mode == "fp8" and not self._fp8_supported:
+            if self._amp_preferred_dtype is torch.bfloat16:
+                new_mode = "bf16"
+            elif self._amp_preferred_dtype is torch.float16:
+                new_mode = "fp16"
+            else:
+                new_mode = "fp32"
         self._amp_mode = new_mode
+        self._update_te_margin(prev_mode, new_mode, overflow)
 
         # 4) Checkpoint policy
         if self._leaves:
@@ -309,6 +408,35 @@ class DPCS:
                 pass
 
         self._step += 1
+
+
+    def _update_te_margin(self, prev_mode: str, new_mode: str, overflow: bool) -> None:
+        if not self._fp8_supported or self._te_recipe is None:
+            self._te_margin = self._te_margin_min
+            return
+
+        margin = int(self._te_margin)
+        changed = False
+
+        if prev_mode == "fp8" and overflow:
+            if self._te_margin_inc > 0:
+                margin = min(self._te_margin_max, margin + self._te_margin_inc)
+                changed = margin != self._te_margin
+        elif new_mode == "fp8":
+            if prev_mode == "fp8" and self._te_margin_dec > 0 and margin > self._te_margin_min:
+                margin = max(self._te_margin_min, margin - self._te_margin_dec)
+                changed = margin != self._te_margin
+        else:
+            if self._te_margin_dec > 0 and margin > self._te_margin_min:
+                margin = max(self._te_margin_min, margin - self._te_margin_dec)
+                changed = margin != self._te_margin
+
+        if changed:
+            self._te_margin = int(margin)
+            try:
+                self._te_recipe.margin = int(self._te_margin)
+            except Exception:
+                pass
 
 
 __all__ = ["DPCS"]
