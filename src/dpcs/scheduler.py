@@ -11,7 +11,7 @@ It keeps the Python hot path small and avoids per-step dynamic allocations.
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import json
 import math
 import os
@@ -90,6 +90,19 @@ class _CkptWrap(nn.Module):
         self._t_ema.update(ms)
         return out
 
+    def __getattr__(self, name: str):
+        mod = self.__dict__.get("mod", None)
+        if mod is None:
+            mod = self._modules.get("mod", None)
+        if mod is not None:
+            if name == "mod":
+                return mod
+            try:
+                return getattr(mod, name)
+            except AttributeError:
+                pass
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
 
 # --------------------------- leaf discovery / wrap -------------------------
 
@@ -112,6 +125,76 @@ def _wrap_leaves(model: nn.Module) -> Tuple[nn.Module, List[_CkptWrap]]:
     model = _wrap(model)
     return model, wrappers
 
+
+# --------------------------- compatibility views -----------------------------
+
+class _LeafState:
+    """Lightweight compatibility view of a wrapped module's state."""
+
+    __slots__ = ("_sched", "index", "wrapper", "last_var_step", "gvar_ema", "last_curv_step")
+
+    def __init__(self, sched: "DPCS", index: int, wrapper: _CkptWrap) -> None:
+        self._sched = sched
+        self.index = index
+        self.wrapper = wrapper
+        self.last_var_step: Optional[float] = None
+        self.gvar_ema: Optional[float] = None
+        self.last_curv_step: Optional[float] = None
+
+    # --- precision ---------------------------------------------------------
+    @property
+    def mode(self) -> str:
+        return self._sched._effective_amp_mode()
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        self._sched.force_precision(str(value))
+
+    @property
+    def cool(self) -> int:
+        pol = getattr(self._sched, "_prec_pol", None)
+        return int(getattr(pol, "cooldown", 0)) if pol is not None else 0
+
+    # --- checkpointing -----------------------------------------------------
+    @property
+    def ckpt_blacklisted(self) -> bool:
+        return self._sched._compat_ckpt_blacklisted(self.index)
+
+
+class _StateRegistry(Mapping[nn.Module, _LeafState]):
+    """Mapping facade that accepts either wrappers or original modules as keys."""
+
+    def __init__(self, states: Sequence[_LeafState]):
+        self._states = list(states)
+        self._by_wrapper: Dict[nn.Module, _LeafState] = {st.wrapper: st for st in self._states}
+        self._by_orig: Dict[nn.Module, _LeafState] = {}
+        for st in self._states:
+            orig = getattr(st.wrapper, "mod", None)
+            if isinstance(orig, nn.Module):
+                self._by_orig[orig] = st
+
+    def __getitem__(self, key: nn.Module) -> _LeafState:
+        st = self._by_wrapper.get(key)
+        if st is None:
+            st = self._by_orig.get(key)
+        if st is None:
+            raise KeyError(key)
+        return st
+
+    def __iter__(self):  # type: ignore[override]
+        return iter(self._by_wrapper.keys())
+
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self._by_wrapper)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._by_wrapper or key in self._by_orig
+
+    def items(self):  # type: ignore[override]
+        return self._by_wrapper.items()
+
+    def values(self):  # type: ignore[override]
+        return self._by_wrapper.values()
 
 # --------------------------------- DPCS ------------------------------------
 
@@ -136,6 +219,12 @@ class DPCS:
         self.cfg = DPCSConfig.from_kwargs(**kwargs)
         self._step = 0
 
+        self._precision_enabled = bool(self.cfg.enable_precision)
+        self._manual_precision_mode: Optional[str] = None
+        self._headroom_override: Optional[Callable[[], Optional[float]]] = None
+        self._compat_states: List[_LeafState] = []
+        self._registry: Mapping[nn.Module, _LeafState] = _StateRegistry([])
+
         # AMP mode string: "fp32" | "bf16" | "fp16" (with optional fp8 runtime wiring)
         self._amp_preferred_dtype = amp_preferred_dtype(self.cfg.device_type)
         if self.cfg.device_type == "cuda" and torch.cuda.is_available():
@@ -148,6 +237,10 @@ class DPCS:
         else:
             self._amp_mode = "fp32"
         self._amp_cooldown = 0
+
+        if not self._precision_enabled:
+            self._manual_precision_mode = "fp32"
+            self._amp_mode = "fp32"
 
         # FP8 runtime state
         self._fp8_supported = False
@@ -164,6 +257,8 @@ class DPCS:
         self._leaves: List[_CkptWrap] = []
         self._grads: Optional[GradSignals] = None
         self._curv: Optional[CurvatureSignals] = None
+        self._ckpt_on: bool = True
+        self._ckpt_selected: set[int] = set()
 
         # Policies
         bf16_supported = (
@@ -187,6 +282,8 @@ class DPCS:
         model, leaves = _wrap_leaves(model)
         self._model = model
         self._leaves = leaves
+        self._compat_states = [_LeafState(self, i, w) for i, w in enumerate(leaves)]
+        self._registry = _StateRegistry(self._compat_states)
 
         # Optional TransformerEngine swap for FP8
         self._fp8_supported = False
@@ -238,6 +335,7 @@ class DPCS:
             max_modules_per_probe=self.cfg.max_modules_per_probe,
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         )
+        self._refresh_compat_stats()
         return model
 
     def set_log_jsonl(self, path: str) -> None:
@@ -251,20 +349,122 @@ class DPCS:
         device_type = self.cfg.device_type
         if device_type != "cuda" or not torch.cuda.is_available():
             return (device_type, torch.float32, False)
-        if self._amp_mode == "fp8":
+        mode = self._effective_amp_mode()
+        if mode == "fp8":
             dtype = self._amp_preferred_dtype
             if dtype not in (torch.bfloat16, torch.float16):
                 dtype = torch.float16
             return ("cuda", dtype, True)
-        if self._amp_mode == "bf16" and self._amp_preferred_dtype is torch.bfloat16:
+        if mode == "bf16" and self._amp_preferred_dtype is torch.bfloat16:
             return ("cuda", torch.bfloat16, True)
-        if self._amp_mode == "fp16":
+        if mode == "fp16":
             return ("cuda", torch.float16, True)
         return ("cuda", torch.float32, False)
 
     def amp_uses_grad_scaler(self) -> bool:
         dev, dtype, enabled = self.get_amp_config()
         return enabled and amp_uses_grad_scaler(dtype, dev)
+
+    def amp_dtype(self) -> torch.dtype:
+        _, dtype, _ = self.get_amp_config()
+        return dtype
+
+    def precision_mix(self) -> Dict[str, int]:
+        mode = self._effective_amp_mode()
+        total = len(self._compat_states) if self._compat_states else len(self._leaves)
+        if total <= 0:
+            return {}
+        return {mode: total}
+
+    # ------------------------- compatibility helpers ----------------------
+
+    def _effective_amp_mode(self) -> str:
+        if self._manual_precision_mode is not None:
+            return self._manual_precision_mode
+        if not self._precision_enabled:
+            return "fp32"
+        return self._amp_mode
+
+    def force_precision(self, mode: Optional[str]) -> None:
+        if mode is None:
+            self.clear_precision_override()
+            return
+        norm = str(mode).lower()
+        if norm in {"auto", "none"}:
+            self.clear_precision_override()
+            return
+        if norm not in {"fp32", "fp16", "bf16", "fp8"}:
+            raise ValueError(f"Unsupported precision override: {mode}")
+        self._manual_precision_mode = norm
+        self._amp_mode = norm
+
+    def force_fp32(self) -> None:
+        self.force_precision("fp32")
+
+    def clear_precision_override(self) -> None:
+        self._manual_precision_mode = None
+        if not self._precision_enabled:
+            self._manual_precision_mode = "fp32"
+            self._amp_mode = "fp32"
+
+    def precision_override(self) -> Optional[str]:
+        return self._manual_precision_mode
+
+    def _refresh_compat_stats(self) -> None:
+        if not self._compat_states:
+            return
+        if self._grads is not None:
+            for st in self._compat_states:
+                st.last_var_step = self._grads.last_var(st.index)
+                st.gvar_ema = self._grads.grad_var(st.index)
+        else:
+            for st in self._compat_states:
+                st.last_var_step = None
+                st.gvar_ema = None
+
+        if self._curv is not None:
+            kappa = self._curv.kappa
+            for st in self._compat_states:
+                if st.index < len(kappa):
+                    st.last_curv_step = kappa[st.index]
+                else:
+                    st.last_curv_step = None
+        else:
+            for st in self._compat_states:
+                st.last_curv_step = None
+
+    def _compat_ckpt_blacklisted(self, index: int) -> bool:
+        pol = getattr(self, "_ckpt_pol", None)
+        if pol is None:
+            return False
+        blacklist = getattr(pol, "_blacklist", None)
+        if isinstance(blacklist, dict):
+            return bool(blacklist.get(int(index), 0))
+        return False
+
+    def _read_headroom(self) -> Optional[float]:
+        if self._headroom_override is not None:
+            try:
+                return self._headroom_override()
+            except Exception:
+                return None
+        return headroom_frac()
+
+    @property
+    def vram_headroom(self) -> Callable[[], Optional[float]]:
+        return self._headroom_override or headroom_frac
+
+    @vram_headroom.setter
+    def vram_headroom(self, fn: Optional[Callable[[], Optional[float]]]) -> None:
+        if fn is None:
+            self._headroom_override = None
+        elif callable(fn):
+            self._headroom_override = fn
+        else:
+            raise TypeError("vram_headroom override must be callable or None")
+
+    def enable_checkpointing(self, enabled: bool) -> None:
+        self._ckpt_on = bool(enabled)
 
     def start_step(self) -> None:
         # Step-scoped peak VRAM reset
@@ -290,6 +490,7 @@ class DPCS:
             except RuntimeError:
                 # Allow training to continue if the current step cannot build HVP
                 pass
+        self._refresh_compat_stats()
 
     def _sync_min_headroom(self, headroom: Optional[float]) -> Optional[float]:
         """Synchronize headroom across ranks via distributed MIN reduce."""
@@ -340,7 +541,7 @@ class DPCS:
 
     def end_step(self, optim: torch.optim.Optimizer, scaler: Optional[torch.amp.GradScaler] = None) -> None:
         # 1) Read memory headroom
-        hr = headroom_frac()
+        hr = self._read_headroom()
         hr = self._sync_min_headroom(hr)
         free_b, total_b = 0, 1
         info = mem_get_info()
@@ -367,24 +568,36 @@ class DPCS:
             if vals:
                 curv_avg = float(sum(vals) / len(vals))
         prev_mode = self._amp_mode
-        new_mode = self._prec_pol.decide(hr, gvar, curv_avg, overflow, prev_mode)
-        if new_mode == "fp8" and not self._fp8_supported:
-            if self._amp_preferred_dtype is torch.bfloat16:
-                new_mode = "bf16"
-            elif self._amp_preferred_dtype is torch.float16:
-                new_mode = "fp16"
-            else:
-                new_mode = "fp32"
+        override_mode = self._manual_precision_mode
+        if not self._precision_enabled:
+            override_mode = override_mode or "fp32"
+        if override_mode is not None:
+            new_mode = override_mode
+        else:
+            new_mode = self._prec_pol.decide(hr, gvar, curv_avg, overflow, prev_mode)
+            if new_mode == "fp8" and not self._fp8_supported:
+                if self._amp_preferred_dtype is torch.bfloat16:
+                    new_mode = "bf16"
+                elif self._amp_preferred_dtype is torch.float16:
+                    new_mode = "fp16"
+                else:
+                    new_mode = "fp32"
         self._amp_mode = new_mode
         self._update_te_margin(prev_mode, new_mode, overflow)
 
         # 4) Checkpoint policy
         if self._leaves:
-            act = [w._act_bytes for w in self._leaves]
-            fwd = [w._t_ema.value if w._t_ema.initialized else 0.0 for w in self._leaves]
-            enable_ids = self._ckpt_pol.plan(act, fwd, hr)
-            for i, w in enumerate(self._leaves):
-                w.use_ckpt = (i in enable_ids)
+            if self._ckpt_on:
+                act = [w._act_bytes for w in self._leaves]
+                fwd = [w._t_ema.value if w._t_ema.initialized else 0.0 for w in self._leaves]
+                enable_ids = self._ckpt_pol.plan(act, fwd, hr)
+                self._ckpt_selected = set(enable_ids)
+                for i, w in enumerate(self._leaves):
+                    w.use_ckpt = (i in enable_ids)
+            else:
+                self._ckpt_selected.clear()
+                for w in self._leaves:
+                    w.use_ckpt = False
 
         # 5) Logging (optional)
         if self._log_path and (self._step % self._log_every == 0):

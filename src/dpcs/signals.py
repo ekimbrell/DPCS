@@ -87,6 +87,7 @@ class GradSignals:
         self.sample_max = int(sample_max_elems)
         self.mean_ema: List[EMA] = [EMA(beta) for _ in self.leaves]
         self.var_ema: List[EMA] = [EMA(beta) for _ in self.leaves]
+        self._last_var: List[Optional[float]] = [None] * len(self.leaves)
         self._hooks: List[torch.utils.hooks.RemovableHandle] = []
 
     def attach(self) -> None:
@@ -131,6 +132,10 @@ class GradSignals:
                 v = float(((sample - m) ** 2).mean())
                 mean_ema.update(m)
                 var_ema.update(v)
+                try:
+                    self._last_var[li] = float(v)
+                except Exception:
+                    self._last_var[li] = None
         return _hook
 
     # Convenience getters ----------------------------------------------------
@@ -147,6 +152,11 @@ class GradSignals:
         if not vals:
             return None
         return float(sum(vals) / len(vals))
+
+    def last_var(self, li: int) -> Optional[float]:
+        if li < 0 or li >= len(self._last_var):
+            return None
+        return self._last_var[li]
 
 
 # ---------------------------- Curvature signals ----------------------------

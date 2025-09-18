@@ -46,8 +46,7 @@ class TinyTransformer(nn.Module):
 
 def _force_fp32_modes(sched: DPCS):
     # helper to keep numerics comparable
-    for st in sched._registry.values():
-        st.mode = "fp32"
+    sched.force_fp32()
 
 
 @pytest.mark.parametrize("device", ["cpu"])  # numerical parity on CPU
