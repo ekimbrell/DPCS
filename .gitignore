@@ -20,6 +20,10 @@ out-hf-dpcs/# training outputs / artifacts
 out-hf-dpcs/
 checkpoint-200/
 runs/
+runs.jsonl
+bench_results.jsonl
+grid_results.csv
+results/
 
 .cache/
 datasets/
