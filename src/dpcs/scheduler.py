@@ -246,10 +246,14 @@ class _StateRegistry(Mapping[nn.Module, _LeafState]):
         self._states = list(states)
         self._by_wrapper: Dict[nn.Module, _LeafState] = {st.wrapper: st for st in self._states}
         self._by_orig: Dict[nn.Module, _LeafState] = {}
+        self._keys: List[nn.Module] = []
         for st in self._states:
             orig = getattr(st.wrapper, "mod", None)
             if isinstance(orig, nn.Module):
                 self._by_orig[orig] = st
+                self._keys.append(orig)
+            else:
+                self._keys.append(st.wrapper)
 
     def __getitem__(self, key: nn.Module) -> _LeafState:
         st = self._by_wrapper.get(key)
@@ -260,6 +264,8 @@ class _StateRegistry(Mapping[nn.Module, _LeafState]):
         return st
 
     def __iter__(self):  # type: ignore[override]
+        if self._keys:
+            return iter(self._keys)
         return iter(self._by_wrapper.keys())
 
     def __len__(self) -> int:  # type: ignore[override]
@@ -269,10 +275,12 @@ class _StateRegistry(Mapping[nn.Module, _LeafState]):
         return key in self._by_wrapper or key in self._by_orig
 
     def items(self):  # type: ignore[override]
-        return self._by_wrapper.items()
+        if self._keys:
+            return [(k, self[k]) for k in self._keys]
+        return list(self._by_wrapper.items())
 
     def values(self):  # type: ignore[override]
-        return self._by_wrapper.values()
+        return list(self._by_wrapper.values())
 
 # --------------------------------- DPCS ------------------------------------
 
@@ -435,7 +443,11 @@ class DPCS:
                 w.set_fp8_support(None)
         for w in leaves:
             w.set_fp8_active(False)
-        self._prec_pol.update_fp8_support(self._fp8_supported)
+        self._prec_pol.update_fp8_support(
+            self._fp8_supported,
+            low_headroom=self.cfg.low_headroom_frac,
+            high_headroom=self.cfg.hi_headroom_frac,
+        )
 
         # Attach gradient hooks (per-parameter) aggregated per leaf
         self._grads = GradSignals(leaves, sample_max_elems=4096, beta=0.9)
