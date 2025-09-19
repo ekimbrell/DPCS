@@ -27,19 +27,26 @@ class DeepMLP(nn.Module):
         return self.net(x)
 
 
-def _force_fp32_modes(sched: DPCS):
-    sched.force_fp32()
+def _force_precision_mode(sched: DPCS, mode: str = "fp32"):
+    sched.force_precision(mode)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for memory regression check")
-def test_checkpointing_reduces_peak_memory_cuda_single_model():
+@pytest.mark.parametrize("baseline_mode", ["bf16", "fp16"])
+def test_checkpointing_reduces_peak_memory_cuda_single_model(baseline_mode):
     """
     Single-model memory regression:
     - Toggle checkpointing OFF/ON on the same wrapped model to avoid contamination
       from a second model's gradients.
-    - Hold precision at FP32 to isolate checkpointing effect.
+    - Use BF16/FP16 baselines to mirror precision-disabled training.
     Success criterion: checkpointing peak memory at least 5% lower than baseline.
     """
+    if baseline_mode == "bf16":
+        try:
+            if not torch.cuda.is_bf16_supported():
+                pytest.skip("CUDA device does not support bfloat16")
+        except Exception:
+            pytest.skip("Unable to query bfloat16 support")
     set_seed(123)
     device = "cuda"
     width, depth, batch, classes = 8192, 10, 64, 1000
@@ -47,7 +54,7 @@ def test_checkpointing_reduces_peak_memory_cuda_single_model():
     model = DeepMLP(width=width, depth=depth, out_dim=classes).to(device)
     sched = DPCS(device_type=device, enable_precision=False)
     model = sched.wrap(model)
-    _force_fp32_modes(sched)
+    _force_precision_mode(sched, baseline_mode)
 
     x = torch.randn(batch, width, device=device)
     y = torch.randint(0, classes, (batch,), device=device)
@@ -92,4 +99,4 @@ def test_checkpointing_reduces_peak_memory_cuda_single_model():
     )
 
     # Numerical parity of loss
-    assert torch.allclose(loss_base, loss_ckpt, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(loss_base, loss_ckpt, rtol=5e-3, atol=1e-5)

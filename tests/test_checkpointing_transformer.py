@@ -44,9 +44,9 @@ class TinyTransformer(nn.Module):
         return self.cls(h[:, 0])
 
 
-def _force_fp32_modes(sched: DPCS):
+def _force_precision_mode(sched: DPCS, mode: str = "fp32"):
     # helper to keep numerics comparable
-    sched.force_fp32()
+    sched.force_precision(mode)
 
 
 @pytest.mark.parametrize("device", ["cpu"])  # numerical parity on CPU
@@ -67,8 +67,8 @@ def test_checkpointing_equivalence_numeric_cpu_transformer(device):
     sched_b = DPCS(device_type=device, enable_precision=False, sdpa_backends=(SDPBackend.MATH,))
     model_a = sched_a.wrap(model_a)
     model_b = sched_b.wrap(model_b)
-    _force_fp32_modes(sched_a)
-    _force_fp32_modes(sched_b)
+    _force_precision_mode(sched_a)
+    _force_precision_mode(sched_b)
 
     # baseline
     sched_a._ckpt_on = False
@@ -89,10 +89,12 @@ def test_checkpointing_equivalence_numeric_cpu_transformer(device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for memory regression check")
-def test_checkpointing_reduces_peak_memory_cuda_transformer_single_model():
+@pytest.mark.parametrize("baseline_mode", ["bf16", "fp16"])
+def test_checkpointing_reduces_peak_memory_cuda_transformer_single_model(baseline_mode):
     """
     Single-model CUDA memory regression on a Transformer encoder stack.
     Wrap entire TransformerEncoderLayer so attention is checkpointed too.
+    Parameterized across BF16/FP16 baselines to mirror precision-disabled runs.
     Force 'math' SDPA backend for clearer deltas.
     Success: checkpointing reduces peak allocator bytes by >=3%.
     """
@@ -108,7 +110,13 @@ def test_checkpointing_reduces_peak_memory_cuda_transformer_single_model():
                  wrap_types=(nn.Linear, nn.TransformerEncoderLayer),
                  sdpa_backends=(SDPBackend.MATH,), force_sdpa_in_blocks=True)
     model = sched.wrap(model)
-    _force_fp32_modes(sched)
+    if baseline_mode == "bf16":
+        try:
+            if not torch.cuda.is_bf16_supported():
+                pytest.skip("CUDA device does not support bfloat16")
+        except Exception:
+            pytest.skip("Unable to query bfloat16 support")
+    _force_precision_mode(sched, baseline_mode)
 
     x = torch.randn(B, S, D, device=device)
     y = torch.randint(0, C, (B,), device=device)
@@ -144,4 +152,4 @@ def test_checkpointing_reduces_peak_memory_cuda_transformer_single_model():
     )
 
     # Also sanity check losses are close (GPU allows a bit looser tol)
-    assert torch.allclose(loss_base, loss_ckpt, rtol=1e-4, atol=1e-6)
+    assert torch.allclose(loss_base, loss_ckpt, rtol=5e-3, atol=1e-5)
