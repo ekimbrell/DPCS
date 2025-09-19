@@ -154,4 +154,13 @@ class DPCSConfig:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
-__all__ = ["DPCSConfig"]
+@dataclass(frozen=True)
+class TelemetryCfg:
+    """Lightweight knobs for optional runtime telemetry hooks."""
+
+    sample_every: int = 16
+    sampled_modules_regex: str = "(attn|ffn|bottleneck)$"
+    enable_timing: bool = False
+
+
+__all__ = ["DPCSConfig", "TelemetryCfg"]

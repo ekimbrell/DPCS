@@ -11,13 +11,15 @@ All classes avoid per-step dynamic allocations and update in-place.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
-import math
+from typing import Dict, Iterable, List, Optional, Pattern, Sequence, Tuple
 import time
 
 import torch
 import torch.nn as nn
+
+from .config import TelemetryCfg
 
 # ------------------------------- Utilities ---------------------------------
 
@@ -307,29 +309,170 @@ class CurvatureSignals:
 
 # -------------------------- Activation & latency ---------------------------
 
-class ForwardTimer:
-    """Reusable CUDA event or CPU timer for forward-pass latency EMA."""
-    __slots__ = ("ev_s", "ev_e", "ema")
-    def __init__(self, beta: float = 0.9) -> None:
-        self.ema = EMA(beta)
-        if torch.cuda.is_available():
-            self.ev_s = torch.cuda.Event(enable_timing=True)
-            self.ev_e = torch.cuda.Event(enable_timing=True)
+class ActivationBytesEMA:
+    """Forward-hook EMA of activation bytes for selected modules."""
+
+    __slots__ = (
+        "_named_modules",
+        "_sample_every",
+        "_pattern",
+        "_handles",
+        "_ema",
+        "_beta",
+        "_step",
+        "_last_sample_step",
+        "_enabled",
+    )
+
+    def __init__(
+        self,
+        named_modules: Sequence[Tuple[str, nn.Module]],
+        cfg: TelemetryCfg,
+        beta: float = 0.9,
+    ) -> None:
+        self._named_modules: List[Tuple[str, nn.Module]] = list(named_modules)
+        se = int(cfg.sample_every)
+        self._sample_every = se if se > 0 else 0
+        pattern_text = cfg.sampled_modules_regex or ""
+        try:
+            pattern: Optional[Pattern[str]] = re.compile(pattern_text)
+        except re.error:
+            pattern = None
+        self._pattern = pattern
+        self._handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._ema: Dict[str, EMA] = {}
+        self._beta = float(beta)
+        self._step = 0
+        self._last_sample_step: Dict[str, int] = {}
+        self._enabled = self._sample_every > 0 and self._pattern is not None
+
+    def attach(self) -> None:
+        """Register lightweight forward hooks on matching modules."""
+        self.detach()
+        if not self._enabled or self._pattern is None:
+            return
+        pattern = self._pattern
+        for name, module in self._named_modules:
+            if pattern.search(name) is None:
+                continue
+            handle = module.register_forward_hook(self._make_hook(name))
+            self._handles.append(handle)
+
+    def detach(self) -> None:
+        for handle in self._handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._handles.clear()
+
+    def set_step(self, step: int) -> None:
+        self._step = max(0, int(step))
+
+    def advance(self) -> int:
+        self._step += 1
+        return self._step
+
+    def ema_value(self, name: str) -> Optional[float]:
+        ema = self._ema.get(name)
+        if ema is None or not ema.initialized:
+            return None
+        return ema.value
+
+    def ema_values(self) -> Dict[str, float]:
+        return {name: ema.value for name, ema in self._ema.items() if ema.initialized}
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def _make_hook(self, name: str):
+        ema_map = self._ema
+        beta = self._beta
+        sample_every = self._sample_every
+        last_step = self._last_sample_step
+
+        def _hook(_module: nn.Module, _inputs, output) -> None:
+            step = self._step
+            if sample_every <= 0 or (step % sample_every) != 0:
+                return
+            if last_step.get(name) == step:
+                return
+            bytes_out = tensor_bytes(output)
+            last_step[name] = step
+            if bytes_out <= 0:
+                return
+            ema = ema_map.get(name)
+            if ema is None:
+                ema = EMA(beta)
+                ema_map[name] = ema
+            ema.update(float(bytes_out))
+
+        return _hook
+
+
+class CudaTimer:
+    """Minimal wrapper over CUDA events used for optional timing."""
+
+    __slots__ = ("_start", "_end")
+
+    def __init__(self, enabled: bool) -> None:
+        self._start: Optional[torch.cuda.Event]
+        self._end: Optional[torch.cuda.Event]
+        if enabled and torch.cuda.is_available():
+            self._start = torch.cuda.Event(enable_timing=True)
+            self._end = torch.cuda.Event(enable_timing=True)
         else:
-            self.ev_s = None  # type: ignore
-            self.ev_e = None  # type: ignore
+            self._start = None
+            self._end = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._start is not None and self._end is not None
 
     def start(self) -> None:
-        if self.ev_s is not None:
-            self.ev_s.record()
+        if self._start is not None:
+            self._start.record()
+
+    def stop(self) -> Optional[float]:
+        if self._start is None or self._end is None:
+            return None
+        self._end.record()
+        return float(self._start.elapsed_time(self._end))
+
+
+class ForwardTimer:
+    """Reusable latency EMA helper gated by telemetry configuration."""
+
+    __slots__ = ("ema", "_enabled", "_cuda_timer", "_cpu_start")
+
+    def __init__(self, beta: float = 0.9, telemetry: Optional[TelemetryCfg] = None) -> None:
+        self.ema = EMA(beta)
+        cfg = telemetry or TelemetryCfg()
+        self._enabled = bool(cfg.enable_timing)
+        self._cuda_timer: Optional[CudaTimer] = None
+        self._cpu_start: float = 0.0
+        if self._enabled and torch.cuda.is_available():
+            self._cuda_timer = CudaTimer(True)
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        if self._cuda_timer is not None and self._cuda_timer.enabled:
+            self._cuda_timer.start()
+        else:
+            self._cpu_start = time.perf_counter()
 
     def stop_update(self) -> float:
-        if self.ev_e is not None and self.ev_s is not None:
-            self.ev_e.record(); self.ev_e.synchronize()
-            ms = float(self.ev_s.elapsed_time(self.ev_e))
+        if not self._enabled:
+            return 0.0
+        if self._cuda_timer is not None and self._cuda_timer.enabled:
+            elapsed = self._cuda_timer.stop()
+            if elapsed is None:
+                return 0.0
+            ms = float(elapsed)
         else:
-            # fallback host timer (rough)
-            ms = 0.0
+            ms = float((time.perf_counter() - self._cpu_start) * 1000.0)
         self.ema.update(ms)
         return ms
 
@@ -339,5 +482,7 @@ __all__ = [
     "tensor_bytes",
     "GradSignals",
     "CurvatureSignals",
+    "ActivationBytesEMA",
+    "CudaTimer",
     "ForwardTimer",
 ]
