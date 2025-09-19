@@ -6,6 +6,7 @@ Usage:
 from __future__ import annotations
 
 from .scheduler import DPCS          # orchestrator
-from .config import DPCSConfig, CheckpointCfg  # frozen configs
+from .config import DPCSConfig, CheckpointCfg
+from .policies import PrecisionCfg
 
-__all__ = ["DPCS", "DPCSConfig", "CheckpointCfg"]
+__all__ = ["DPCS", "DPCSConfig", "CheckpointCfg", "PrecisionCfg"]

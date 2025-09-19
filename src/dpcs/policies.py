@@ -62,11 +62,12 @@ class PrecisionCfg:
 class PrecisionPolicy:
     """Finite-state policy for AMP mode selection.
 
-    Modes: "fp32", "bf16", "fp16". FP8 support is intentionally not wired for
-    the conservative "v0" policy; once the system has gathered enough stable
-    steps it demotes from fp32 to the preferred low-precision mode (bf16 when
-    available, otherwise fp16). Any overflow observation triggers an immediate
-    promotion back to fp32 with a short cooldown window to reassess stability.
+    Modes: "fp32", "bf16", "fp16", and optionally "fp8" when TransformerEngine
+    replacements are available. The conservative policy starts in fp32, waits
+    for ``patience`` stable steps, and then demotes to the preferred low-precision
+    mode (bf16 when available, otherwise fp16). Any overflow observation triggers
+    an immediate promotion back to fp32 with a short cooldown window to reassess
+    stability. FP8 decisions are gated by the runtime via :meth:`update_fp8_support`.
     """
 
     def __init__(self, cfg: PrecisionCfg, bf16_supported: bool, amp_available: bool = True) -> None:
@@ -84,6 +85,32 @@ class PrecisionPolicy:
         half = patience // 2
         self._cooldown_window = max(1, min(2, max(1, half)))
         self._stable_steps = 0
+        # FP8 gating (configured lazily by the scheduler)
+        self._fp8_supported = False
+        self._fp8_low_headroom = 0.05
+        self._fp8_high_headroom = 0.10
+        self._fp8_reentry_cooldown = 0
+
+    def update_fp8_support(
+        self,
+        supported: bool,
+        low_headroom: Optional[float] = None,
+        high_headroom: Optional[float] = None,
+    ) -> None:
+        """Toggle FP8 support and refresh headroom thresholds if provided."""
+
+        self._fp8_supported = bool(supported)
+        if low_headroom is not None:
+            self._fp8_low_headroom = _clamp01(float(low_headroom))
+        if high_headroom is not None:
+            self._fp8_high_headroom = _clamp01(float(high_headroom))
+        if self._fp8_high_headroom < self._fp8_low_headroom:
+            self._fp8_low_headroom, self._fp8_high_headroom = (
+                self._fp8_high_headroom,
+                self._fp8_low_headroom,
+            )
+        if not self._fp8_supported:
+            self._fp8_reentry_cooldown = 0
 
     def decide(
         self,
@@ -93,17 +120,52 @@ class PrecisionPolicy:
         overflow: bool,
         current: str,
     ) -> str:
-        del headroom, grad_var, curvature  # unused in the conservative policy
+        del grad_var, curvature  # unused in the conservative policy
+
+        if self._fp8_reentry_cooldown > 0:
+            self._fp8_reentry_cooldown -= 1
+
+        mode = str(current).lower()
+        if mode not in {"fp32", "bf16", "fp16", "fp8"}:
+            mode = "fp32"
+
+        if overflow:
+            self.cooldown = self._cooldown_window
+            self._stable_steps = 0
+            if mode == "fp8":
+                self._fp8_reentry_cooldown = max(self._fp8_reentry_cooldown, self._cooldown_window)
+            return "fp32"
+
         if not self.amp_available or self.low_mode == "fp32":
             self.cooldown = 0
             self._stable_steps = 0
             return "fp32"
 
-        mode = str(current).lower()
-        if overflow:
-            self.cooldown = self._cooldown_window
-            self._stable_steps = 0
-            return "fp32"
+        fp8_supported = self._fp8_supported and self.amp_available
+        hr = None if headroom is None else float(headroom)
+
+        if not fp8_supported and mode == "fp8":
+            mode = "fp32"
+
+        if fp8_supported:
+            if mode == "fp8":
+                if hr is not None and hr >= self._fp8_high_headroom:
+                    mode = "fp32"
+                    self._fp8_reentry_cooldown = max(
+                        self._fp8_reentry_cooldown, self._cooldown_window
+                    )
+                    self._stable_steps = 0
+                else:
+                    self.cooldown = 0
+                    self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+                    return "fp8"
+            elif hr is not None and hr <= self._fp8_low_headroom and self._fp8_reentry_cooldown == 0:
+                self.cooldown = 0
+                self._stable_steps = 0
+                self._fp8_reentry_cooldown = max(
+                    self._fp8_reentry_cooldown, self._cooldown_window
+                )
+                return "fp8"
 
         if mode != "fp32" and mode not in {"bf16", "fp16"}:
             mode = "fp32"
