@@ -240,6 +240,7 @@ def attach_timing_hooks(model: nn.Module) -> Tuple[List[ForwardTimer], List[torc
 class BenchResult:
     ema_ms: float
     peak_bytes: int
+    compiled: bool = False
 
 
 def synthetic_transformer_batch(batch_size: int, seq_len: int, vocab: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -262,16 +263,45 @@ def run_model(
     steps: int,
     enable_activation: bool,
     enable_timing: bool,
+    compile_mode: bool = False,
 ) -> BenchResult:
+    compile_requested = compile_mode
+    use_activation = enable_activation
+    use_timing = enable_timing
+
+    if compile_requested and (use_activation or use_timing):
+        print(
+            f"[{name}] compile_mode=True disables activation/timing hooks to avoid graph breaks.",
+            file=sys.stderr,
+        )
+        use_activation = False
+        use_timing = False
+
     model = model_ctor().to(device)
     model.train(True)
+
+    compile_fn = getattr(torch, "compile", None)
+    compiled = False
+    if compile_requested:
+        if compile_fn is None:
+            print(f"[{name}] WARNING: torch.compile is unavailable; running in eager mode.", file=sys.stderr)
+        else:
+            try:
+                model = compile_fn(model, backend="inductor")
+                compiled = True
+            except Exception as exc:  # pragma: no cover - defensive, compile path is best effort
+                print(
+                    f"[{name}] WARNING: torch.compile(model) failed ({exc}). Falling back to eager mode.",
+                    file=sys.stderr,
+                )
+
     optimizer = optim.AdamW(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
 
-    activation = attach_activation_hooks(model) if enable_activation else None
+    activation = attach_activation_hooks(model) if use_activation else None
     timers: List[ForwardTimer] = []
     timing_handles: List[torch.utils.hooks.RemovableHandle] = []
-    if enable_timing:
+    if use_timing:
         timers, timing_handles = attach_timing_hooks(model)
 
     ema = ScalarEMA(beta=0.9)
@@ -279,9 +309,13 @@ def run_model(
 
     inputs, targets = data_fn(device)
 
-    for step in range(steps):
-        if activation is not None:
-            activation.set_step(step)
+    warmup_steps = 1 if compiled else 0
+    total_steps = steps + warmup_steps
+
+    for raw_step in range(total_steps):
+        logical_step = raw_step - warmup_steps
+        if activation is not None and logical_step >= 0:
+            activation.set_step(logical_step)
         if device.type == "cuda":
             torch.cuda.synchronize()
         reset_step_peak(device)
@@ -296,9 +330,10 @@ def run_model(
         if device.type == "cuda":
             torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        ema.update(elapsed_ms)
-        peak = get_step_peak(device)
-        peak_max = max(peak_max, peak)
+        if logical_step >= 0:
+            ema.update(elapsed_ms)
+            peak = get_step_peak(device)
+            peak_max = max(peak_max, peak)
 
     if activation is not None:
         activation.detach()
@@ -313,7 +348,7 @@ def run_model(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return BenchResult(ema_ms=ema.value, peak_bytes=peak_max)
+    return BenchResult(ema_ms=ema.value, peak_bytes=peak_max, compiled=compiled)
 
 
 # ------------------------------ CLI runner ---------------------------------
@@ -332,6 +367,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--steps", type=int, default=200, help="Steps per configuration")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument(
+        "--compile-mode",
+        action="store_true",
+        help="Run an additional torch.compile (inductor) comparison for the baseline mode.",
+    )
     args = ap.parse_args(argv)
 
     device = torch.device(args.device)
@@ -391,6 +431,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(
                 f"Mode {mode} ({cfg['label']}), {bench_name}: "
                 f"step_ema={result.ema_ms:.3f} ms, peak={format_bytes(result.peak_bytes)}"
+            )
+
+    compile_speedups: Dict[str, float] = {}
+    if args.compile_mode:
+        expected_speedup = 1.0
+        for bench_name, (ctor, data_fn) in benches.items():
+            eager_result = results.get("A", {}).get(bench_name)
+            if eager_result is None:
+                continue
+            compile_result = run_model(
+                bench_name,
+                ctor,
+                data_fn,
+                device=device,
+                steps=steps,
+                enable_activation=False,
+                enable_timing=False,
+                compile_mode=True,
+            )
+            if not compile_result.compiled:
+                print(
+                    f"[{bench_name}] WARNING: torch.compile run was skipped; speedup comparison unavailable.",
+                    file=sys.stderr,
+                )
+                continue
+            compile_speedups[bench_name] = (
+                0.0
+                if compile_result.ema_ms <= 0
+                else eager_result.ema_ms / compile_result.ema_ms
+            )
+            speedup = compile_speedups[bench_name]
+            print(
+                f"[compile] {bench_name}: eager={eager_result.ema_ms:.3f} ms -> "
+                f"compile={compile_result.ema_ms:.3f} ms ({speedup:.2f}x)",
+            )
+            if speedup + 1e-9 < expected_speedup:
+                print(
+                    f"WARNING: {bench_name} torch.compile speedup {speedup:.2f}x < expected {expected_speedup:.2f}x.",
+                    file=sys.stderr,
+                )
+        if compile_speedups:
+            mean_speedup = sum(compile_speedups.values()) / len(compile_speedups)
+            print(
+                f"Mean torch.compile speedup across benches: {mean_speedup:.2f}x",
             )
 
     def mean_step_ema(mode_results: Dict[str, BenchResult]) -> float:
