@@ -15,50 +15,64 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import json
 import math
 import os
-import time
 
 import torch
 import torch.nn as nn
 
-from .config import DPCSConfig
+from .config import DPCSConfig, CheckpointCfg
 from .policies import PrecisionPolicy, CheckpointPolicy
 from .signals import GradSignals, CurvatureSignals, EMA, tensor_bytes
 from .runtime import (
     amp_preferred_dtype,
-    amp_enabled,
     amp_uses_grad_scaler,
     reset_peak_memory_stats,
     max_memory_allocated,
     mem_get_info,
     headroom_frac,
-    checkpoint_call,
     te_prepare_fp8_modules,
     te_fp8_autocast,
 )
 
 # ------------------------ checkpointable leaf wrapper -----------------------
 
-class _CkptWrap(nn.Module):
-    """Wrap a leaf to optionally run under activation checkpointing.
+def _call_with_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Callable[..., Any]:
+    if not kwargs:
+        return fn
 
-    Also records lightweight telemetry per forward (activation bytes, latency
-    EMA). Uses non-reentrant checkpointing with no RNG state stash.
-    """
-    def __init__(self, mod: nn.Module) -> None:
+    def _inner(*inputs: Any) -> Any:
+        return fn(*inputs, **kwargs)
+
+    return _inner
+
+
+class _CkptWrap(nn.Module):
+    """Wrap a leaf to optionally run under activation checkpointing."""
+
+    def __init__(self, mod: nn.Module, ckpt_cfg: CheckpointCfg, name: Optional[str] = None) -> None:
         super().__init__()
         self.mod = mod
         self.use_ckpt: bool = False
+        self._ckpt_cfg = ckpt_cfg
+        self._leaf_name = name or type(mod).__qualname__
         self._act_bytes: int = 0
-        self._t_ema = EMA(beta=0.9)
+        self._act_ema = EMA(beta=0.9)
         self._fp8_ready: bool = False
         self._fp8_active: bool = False
         self._fp8_recipe: Optional[Any] = None
-        if torch.cuda.is_available():
-            self._ev_s = torch.cuda.Event(enable_timing=True)
-            self._ev_e = torch.cuda.Event(enable_timing=True)
-        else:
-            self._ev_s = None  # type: ignore
-            self._ev_e = None  # type: ignore
+
+    @property
+    def leaf_name(self) -> str:
+        return self._leaf_name
+
+    @property
+    def activation_bytes(self) -> int:
+        return self._act_bytes
+
+    @property
+    def activation_bytes_ema(self) -> float:
+        if self._act_ema.initialized:
+            return float(self._act_ema.value)
+        return float(self._act_bytes)
 
     def set_fp8_support(self, recipe: Optional[Any]) -> None:
         self._fp8_ready = recipe is not None
@@ -70,25 +84,32 @@ class _CkptWrap(nn.Module):
         self._fp8_active = bool(active and self._fp8_ready)
 
     def forward(self, *args, **kwargs):  # type: ignore[override]
-        # timing start
-        if self._ev_s is not None:
-            self._ev_s.record()
-        t0 = time.perf_counter()
         ctx = te_fp8_autocast(self._fp8_active, self._fp8_recipe)
         with ctx:
             if self.use_ckpt:
-                out = checkpoint_call(self.mod, *args, **kwargs)
+                out = self._checkpoint_call(*args, **kwargs)
             else:
                 out = self.mod(*args, **kwargs)
-        # activation bytes and elapsed
         self._act_bytes = tensor_bytes(out)
-        if self._ev_e is not None and self._ev_s is not None:
-            self._ev_e.record(); self._ev_e.synchronize()
-            ms = float(self._ev_s.elapsed_time(self._ev_e))
-        else:
-            ms = (time.perf_counter() - t0) * 1e3
-        self._t_ema.update(ms)
+        self._act_ema.update(float(self._act_bytes))
         return out
+
+    def _checkpoint_call(self, *args, **kwargs):
+        try:
+            from torch.utils.checkpoint import checkpoint as _ckpt
+        except Exception:  # pragma: no cover - torch without checkpoint utility
+            return self.mod(*args, **kwargs)
+
+        fn = _call_with_kwargs(self.mod, dict(kwargs))
+        try:
+            return _ckpt(
+                fn,
+                *args,
+                use_reentrant=bool(self._ckpt_cfg.use_reentrant),
+                preserve_rng_state=bool(self._ckpt_cfg.preserve_rng_state),
+            )
+        except TypeError:
+            return _ckpt(fn, *args)
 
     def __getattr__(self, name: str):
         mod = self.__dict__.get("mod", None)
@@ -112,17 +133,20 @@ def _is_leaf(m: nn.Module) -> bool:
     return (len(list(m.children())) == 0) or isinstance(m, _LEAF_TYPES)
 
 
-def _wrap_leaves(model: nn.Module) -> Tuple[nn.Module, List[_CkptWrap]]:
+def _wrap_leaves(model: nn.Module, ckpt_cfg: CheckpointCfg) -> Tuple[nn.Module, List[_CkptWrap]]:
     wrappers: List[_CkptWrap] = []
-    def _wrap(module: nn.Module) -> nn.Module:
+
+    def _wrap(module: nn.Module, prefix: str) -> nn.Module:
         if _is_leaf(module):
-            w = _CkptWrap(module)
+            w = _CkptWrap(module, ckpt_cfg, prefix or type(module).__qualname__)
             wrappers.append(w)
             return w
         for name, child in list(module.named_children()):
-            setattr(module, name, _wrap(child))
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            setattr(module, name, _wrap(child, child_prefix))
         return module
-    model = _wrap(model)
+
+    model = _wrap(model, "")
     return model, wrappers
 
 
@@ -215,8 +239,20 @@ class DPCS:
       - _step: int
     """
 
+    @staticmethod
+    def _normalize_checkpoint_cfg(value: Any) -> CheckpointCfg:
+        if value is None:
+            return CheckpointCfg()
+        if isinstance(value, CheckpointCfg):
+            return value
+        if isinstance(value, Mapping):
+            return CheckpointCfg(**dict(value))
+        raise TypeError("checkpoint_cfg must be a CheckpointCfg, mapping, or None")
+
     def __init__(self, **kwargs: Any) -> None:
+        ckpt_cfg_in = kwargs.pop("checkpoint_cfg", None)
         self.cfg = DPCSConfig.from_kwargs(**kwargs)
+        self._ckpt_cfg = self._normalize_checkpoint_cfg(ckpt_cfg_in)
         self._step = 0
 
         self._precision_enabled = bool(self.cfg.enable_precision)
@@ -224,6 +260,7 @@ class DPCS:
         self._headroom_override: Optional[Callable[[], Optional[float]]] = None
         self._compat_states: List[_LeafState] = []
         self._registry: Mapping[nn.Module, _LeafState] = _StateRegistry([])
+        self._leaf_names: List[str] = []
 
         # AMP mode string: "fp32" | "bf16" | "fp16" (with optional fp8 runtime wiring)
         self._amp_preferred_dtype = amp_preferred_dtype(self.cfg.device_type)
@@ -267,7 +304,7 @@ class DPCS:
             and self._amp_preferred_dtype is torch.bfloat16
         )
         self._prec_pol = PrecisionPolicy(self.cfg, bf16_supported=bf16_supported, fp8_supported=False)
-        self._ckpt_pol = CheckpointPolicy(self.cfg)
+        self._ckpt_pol = CheckpointPolicy(self.cfg, self._ckpt_cfg)
 
         # Overflow tracking
         self._last_scale: Optional[float] = None
@@ -279,9 +316,10 @@ class DPCS:
     # ------------------------------ API ------------------------------------
 
     def wrap(self, model: nn.Module) -> nn.Module:
-        model, leaves = _wrap_leaves(model)
+        model, leaves = _wrap_leaves(model, self._ckpt_cfg)
         self._model = model
         self._leaves = leaves
+        self._leaf_names = [w.leaf_name for w in leaves]
         self._compat_states = [_LeafState(self, i, w) for i, w in enumerate(leaves)]
         self._registry = _StateRegistry(self._compat_states)
 
@@ -543,11 +581,13 @@ class DPCS:
         # 1) Read memory headroom
         hr = self._read_headroom()
         hr = self._sync_min_headroom(hr)
-        free_b, total_b = 0, 1
+        free_b: Optional[int] = None
+        total_b: Optional[int] = None
         info = mem_get_info()
-        
+
         if info is not None:
             free_b, total_b = info
+        peak_b = max_memory_allocated()
 
         # 2) Detect AMP overflow via GradScaler scale drop
         overflow = False
@@ -588,12 +628,11 @@ class DPCS:
         # 4) Checkpoint policy
         if self._leaves:
             if self._ckpt_on:
-                act = [w._act_bytes for w in self._leaves]
-                fwd = [w._t_ema.value if w._t_ema.initialized else 0.0 for w in self._leaves]
-                enable_ids = self._ckpt_pol.plan(act, fwd, hr)
+                act = [w.activation_bytes_ema for w in self._leaves]
+                enable_ids = self._ckpt_pol.plan(act, hr, free_b, peak_b)
                 self._ckpt_selected = set(enable_ids)
                 for i, w in enumerate(self._leaves):
-                    w.use_ckpt = (i in enable_ids)
+                    w.use_ckpt = (i in self._ckpt_selected)
             else:
                 self._ckpt_selected.clear()
                 for w in self._leaves:
@@ -608,12 +647,22 @@ class DPCS:
                 "overflow": bool(overflow),
                 "ckpt_on": int(sum(1 for w in self._leaves if w.use_ckpt)),
                 "num_leaves": int(len(self._leaves)),
-                "peak_alloc_bytes": int(max_memory_allocated()),
-                "free_bytes": int(free_b),
-                "total_bytes": int(total_b),
+                "peak_alloc_bytes": int(peak_b),
+                "free_bytes": int(free_b) if free_b is not None else 0,
+                "total_bytes": int(total_b) if total_b is not None else 0,
                 "grad_var_avg": float(gvar) if gvar is not None else None,
                 "curv_avg": float(curv_avg) if curv_avg is not None else None,
             }
+            if self._ckpt_selected:
+                ids = sorted(int(i) for i in self._ckpt_selected)
+            else:
+                ids = []
+            rec["ckpt_ids"] = ids
+            if ids and self._leaf_names:
+                rec["ckpt_modules"] = [
+                    self._leaf_names[i] if 0 <= i < len(self._leaf_names) else str(i)
+                    for i in ids
+                ]
             try:
                 with open(self._log_path, "a") as f:
                     f.write(json.dumps(rec) + "\n")
