@@ -163,7 +163,10 @@ def _wrap_model_with_dpcs(model: nn.Module, device: str, cfg: BenchConfig) -> DP
                 allow_fp8=cfg.allow_fp8)
     model = dpcs.wrap(model)
     if not cfg.enable_precision:
-        dpcs.force_fp32()
+        if device == "cuda" and torch.cuda.is_available():
+            dpcs.force_precision("fp16")
+        else:
+            dpcs.force_fp32()
     # set ckpt policy
     dpcs._ckpt_on = bool(cfg.enable_ckpt)
     return dpcs
