@@ -250,14 +250,30 @@ def _train_loop(cfg: BenchConfig, jsonl_path: Optional[str]) -> Dict[str, Any]:
 
     # One eval loss (FP32) for sanity
     model.eval()
-    with torch.no_grad():
-        if device == "cuda":
-            torch.cuda.synchronize()
-        out = model(x.float()) if use_amp else model(x)
-        eval_loss = float(crit(out, y).item())
-        if device == "cuda":
-            torch.cuda.synchronize()
-    model.train()
+    restore_override: Optional[str] = None
+    restore_mode: Optional[str] = None
+    if use_amp:
+        restore_override = dpcs.precision_override()
+        restore_mode = getattr(dpcs, "_amp_mode", None)
+        dpcs.force_fp32()
+    try:
+        with torch.no_grad():
+            if device == "cuda":
+                torch.cuda.synchronize()
+            eval_input = x.float() if use_amp else x
+            out = model(eval_input)
+            eval_loss = float(crit(out, y).item())
+            if device == "cuda":
+                torch.cuda.synchronize()
+    finally:
+        if use_amp:
+            if restore_override is None:
+                if restore_mode is not None:
+                    setattr(dpcs, "_amp_mode", restore_mode)
+                dpcs.clear_precision_override()
+            else:
+                dpcs.force_precision(restore_override)
+        model.train()
 
     # Emit row
     row = {
