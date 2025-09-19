@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from .config import DPCSConfig, CheckpointCfg
-from .policies import PrecisionPolicy, CheckpointPolicy
+from .policies import PrecisionPolicy, CheckpointPolicy, PrecisionCfg
 from .signals import GradSignals, CurvatureSignals, EMA, tensor_bytes
 from .runtime import (
     amp_preferred_dtype,
@@ -62,6 +62,9 @@ class _CkptWrap(nn.Module):
         self._fp8_ready: bool = False
         self._fp8_active: bool = False
         self._fp8_recipe: Optional[Any] = None
+        self._autocast_enabled: bool = False
+        self._autocast_dtype: torch.dtype = torch.float32
+        self._autocast_device_type: str = "cuda"
 
     @property
     def leaf_name(self) -> str:
@@ -86,9 +89,19 @@ class _CkptWrap(nn.Module):
     def set_fp8_active(self, active: bool) -> None:
         self._fp8_active = bool(active and self._fp8_ready)
 
+    def set_autocast(self, device_type: str, dtype: torch.dtype, enabled: bool) -> None:
+        self._autocast_device_type = str(device_type)
+        self._autocast_dtype = dtype
+        self._autocast_enabled = bool(enabled)
+
     def forward(self, *args, **kwargs):  # type: ignore[override]
         ctx = te_fp8_autocast(self._fp8_active, self._fp8_recipe)
-        with ctx:
+        amp_ctx = torch.autocast(
+            device_type=self._autocast_device_type,
+            dtype=self._autocast_dtype,
+            enabled=self._autocast_enabled,
+        )
+        with ctx, amp_ctx:
             if self.use_ckpt:
                 out = self._checkpoint_call(*args, **kwargs)
             else:
@@ -154,6 +167,44 @@ def _wrap_leaves(model: nn.Module, ckpt_cfg: CheckpointCfg) -> Tuple[nn.Module, 
 
 
 # --------------------------- compatibility views -----------------------------
+
+
+class AmpOverflowMonitor:
+    """Context manager that records GradScaler scale changes around ``update``."""
+
+    def __init__(self, scheduler: "DPCS", scaler: torch.amp.GradScaler) -> None:
+        self._scheduler = scheduler
+        self._scaler = scaler
+        self._scale_before: Optional[float] = None
+
+    def _read_scale(self) -> Optional[float]:
+        scaler = self._scaler
+        if scaler is None:
+            return None
+        get_scale = getattr(scaler, "get_scale", None)
+        if get_scale is None or not callable(get_scale):
+            return None
+        try:
+            return float(get_scale())
+        except Exception:
+            return None
+
+    def __enter__(self) -> torch.amp.GradScaler:
+        self._scale_before = self._read_scale()
+        return self._scaler
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        scale_after = self._read_scale()
+        before = self._scale_before
+        self._scale_before = None
+        if (
+            before is not None
+            and scale_after is not None
+            and scale_after < before
+        ):
+            self._scheduler._amp_overflow = True
+        return False
+
 
 class _LeafState:
     """Lightweight compatibility view of a wrapped module's state."""
@@ -252,10 +303,22 @@ class DPCS:
             return CheckpointCfg(**dict(value))
         raise TypeError("checkpoint_cfg must be a CheckpointCfg, mapping, or None")
 
+    @staticmethod
+    def _normalize_precision_cfg(value: Any) -> PrecisionCfg:
+        if value is None:
+            return PrecisionCfg()
+        if isinstance(value, PrecisionCfg):
+            return value
+        if isinstance(value, Mapping):
+            return PrecisionCfg(**dict(value))
+        raise TypeError("precision_cfg must be a PrecisionCfg, mapping, or None")
+
     def __init__(self, **kwargs: Any) -> None:
         ckpt_cfg_in = kwargs.pop("checkpoint_cfg", None)
+        prec_cfg_in = kwargs.pop("precision_cfg", None)
         self.cfg = DPCSConfig.from_kwargs(**kwargs)
         self._ckpt_cfg = self._normalize_checkpoint_cfg(ckpt_cfg_in)
+        self._prec_cfg = self._normalize_precision_cfg(prec_cfg_in)
         self._step = 0
 
         self._precision_enabled = bool(self.cfg.enable_precision)
@@ -276,18 +339,10 @@ class DPCS:
             tick_i = 1
         self._ddp_tick_every = tick_i
 
-        # AMP mode string: "fp32" | "bf16" | "fp16" (with optional fp8 runtime wiring)
+        # AMP mode selection (bf16 preferred when supported, otherwise fp16).
         self._amp_preferred_dtype = amp_preferred_dtype(self.cfg.device_type)
-        if self.cfg.device_type == "cuda" and torch.cuda.is_available():
-            if self._amp_preferred_dtype is torch.bfloat16:
-                self._amp_mode = "bf16"
-            elif self._amp_preferred_dtype is torch.float16:
-                self._amp_mode = "fp16"
-            else:
-                self._amp_mode = "fp16"
-        else:
-            self._amp_mode = "fp32"
-        self._amp_cooldown = 0
+        self._amp_device_available = self.cfg.device_type == "cuda" and torch.cuda.is_available()
+        self._amp_mode = "fp32"
 
         if not self._precision_enabled:
             self._manual_precision_mode = "fp32"
@@ -312,20 +367,23 @@ class DPCS:
         self._ckpt_selected: set[int] = set()
 
         # Policies
-        bf16_supported = (
-            self.cfg.device_type == "cuda"
-            and torch.cuda.is_available()
-            and self._amp_preferred_dtype is torch.bfloat16
+        bf16_supported = self._amp_device_available and self._amp_preferred_dtype is torch.bfloat16
+        self._prec_pol = PrecisionPolicy(
+            self._prec_cfg,
+            bf16_supported=bf16_supported,
+            amp_available=self._amp_device_available,
         )
-        self._prec_pol = PrecisionPolicy(self.cfg, bf16_supported=bf16_supported, fp8_supported=False)
         self._ckpt_pol = CheckpointPolicy(self.cfg, self._ckpt_cfg)
 
         # Overflow tracking
         self._last_scale: Optional[float] = None
+        self._amp_overflow: bool = False
 
         # Logging
         self._log_path: Optional[str] = None
         self._log_every = max(1, int(self.cfg.log_every))
+
+        self._update_autocast()
 
     # ------------------------------ API ------------------------------------
 
@@ -338,6 +396,7 @@ class DPCS:
         self._registry = _StateRegistry(self._compat_states)
         self._decision_buffer = None
         self._rebuild_module_index()
+        self._update_autocast()
 
         # Optional TransformerEngine swap for FP8
         self._fp8_supported = False
@@ -432,6 +491,20 @@ class DPCS:
 
     # ------------------------- compatibility helpers ----------------------
 
+    def _update_autocast(self) -> None:
+        device_type = self.cfg.device_type
+        enabled = False
+        dtype = torch.float32
+        if device_type == "cuda" and torch.cuda.is_available():
+            if self._amp_mode == "bf16":
+                enabled = True
+                dtype = torch.bfloat16
+            elif self._amp_mode == "fp16":
+                enabled = True
+                dtype = torch.float16
+        for w in self._leaves:
+            w.set_autocast(device_type=device_type, dtype=dtype, enabled=enabled)
+
     def _effective_amp_mode(self) -> str:
         if self._manual_precision_mode is not None:
             return self._manual_precision_mode
@@ -451,6 +524,7 @@ class DPCS:
             raise ValueError(f"Unsupported precision override: {mode}")
         self._manual_precision_mode = norm
         self._amp_mode = norm
+        self._update_autocast()
 
     def force_fp32(self) -> None:
         self.force_precision("fp32")
@@ -460,6 +534,7 @@ class DPCS:
         if not self._precision_enabled:
             self._manual_precision_mode = "fp32"
             self._amp_mode = "fp32"
+        self._update_autocast()
 
     def precision_override(self) -> Optional[str]:
         return self._manual_precision_mode
@@ -554,6 +629,7 @@ class DPCS:
             return
 
         self._amp_mode = self._bits_to_precision(base_val & 0b11)
+        self._update_autocast()
 
         if not self._module_slots or not self._leaves:
             self._ckpt_selected = set()
@@ -625,7 +701,13 @@ class DPCS:
     def enable_checkpointing(self, enabled: bool) -> None:
         self._ckpt_on = bool(enabled)
 
+    def overflow_monitor(self, scaler: torch.amp.GradScaler) -> AmpOverflowMonitor:
+        if scaler is None:
+            raise TypeError("scaler must be a GradScaler instance")
+        return AmpOverflowMonitor(self, scaler)
+
     def start_step(self) -> None:
+        self._amp_overflow = False
         # Step-scoped peak VRAM reset
         reset_peak_memory_stats()
         # Decay blacklist counters for ckpt policy
@@ -711,7 +793,8 @@ class DPCS:
         peak_b = max_memory_allocated()
 
         # 2) Detect AMP overflow via GradScaler scale drop
-        overflow = False
+        overflow = bool(self._amp_overflow)
+        self._amp_overflow = False
         if scaler is not None and getattr(scaler, "is_enabled", lambda: False)():
             try:
                 curr = float(scaler.get_scale())
@@ -720,6 +803,13 @@ class DPCS:
                 self._last_scale = curr
             except Exception:
                 pass
+        elif scaler is not None:
+            try:
+                self._last_scale = float(scaler.get_scale())
+            except Exception:
+                self._last_scale = None
+        else:
+            self._last_scale = None
 
         # 3) Precision policy (global)
         gvar = self._grads.grad_var_avg() if self._grads is not None else None
@@ -744,6 +834,7 @@ class DPCS:
                 else:
                     new_mode = "fp32"
         self._amp_mode = new_mode
+        self._update_autocast()
         self._update_te_margin(prev_mode, new_mode, overflow)
 
         # 4) Checkpoint policy
@@ -825,4 +916,4 @@ class DPCS:
                 pass
 
 
-__all__ = ["DPCS"]
+__all__ = ["DPCS", "AmpOverflowMonitor"]
