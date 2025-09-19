@@ -9,6 +9,9 @@ Exposed functions (stable):
 - amp_uses_grad_scaler(dtype: torch.dtype, device_type: str) -> bool
 - sdpa_backends_normalize(backends: Iterable[Any]) -> Tuple[Any, ...]
 - sdpa_context(force: bool, backends: Iterable[Any]) -> ContextManager
+- get_mem_info(device: Optional[int | torch.device]) -> tuple[int, int]
+- reset_step_peak(device: Optional[int | torch.device]) -> None
+- get_step_peak(device: Optional[int | torch.device]) -> int
 - reset_peak_memory_stats() -> None
 - max_memory_allocated() -> int
 - mem_get_info() -> Optional[Tuple[int, int]]
@@ -210,45 +213,83 @@ def te_fp8_autocast(enabled: bool, recipe: Optional[Any] = None):
 
 # Memory helpers --------------------------------------------------------------
 
-def reset_peak_memory_stats() -> None:
-    """Reset CUDA peak memory stats if available (step-scoped peaks)."""
+def get_mem_info(device: Optional[torch.device | int] = None) -> tuple[int, int]:
+    """Return ``(free_bytes, total_bytes)`` from :func:`torch.cuda.memory.mem_get_info`."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for get_mem_info")
+    try:
+        free, total = torch.cuda.memory.mem_get_info(device)
+    except AttributeError:
+        legacy = getattr(torch.cuda, "mem_get_info", None)
+        if legacy is None:
+            raise RuntimeError("torch.cuda.mem_get_info is unavailable")
+        try:
+            free, total = legacy(device) if device is not None else legacy()
+        except TypeError:
+            free, total = legacy()
+    return int(free), int(total)
+
+
+def reset_step_peak(device: Optional[torch.device | int] = None) -> None:
+    """Reset allocator peaks via :func:`torch.cuda.memory.reset_peak_memory_stats`."""
+
     if not torch.cuda.is_available():
         return
     try:
-        torch.cuda.memory.reset_peak_memory_stats()
-    except Exception:
-        try:
-            torch.cuda.reset_peak_memory_stats()  # older API
-        except Exception:
-            pass
+        torch.cuda.memory.reset_peak_memory_stats(device)
+    except AttributeError:
+        legacy = getattr(torch.cuda, "reset_peak_memory_stats", None)
+        if legacy is None:
+            return
+        if device is None:
+            legacy()
+        else:
+            try:
+                legacy(device)
+            except TypeError:
+                legacy()
 
 
-def max_memory_allocated() -> int:
-    """Return step-scoped peak allocated bytes if available, else 0."""
+def get_step_peak(device: Optional[torch.device | int] = None) -> int:
+    """Return step peak bytes from :func:`torch.cuda.memory.max_memory_allocated` since reset."""
+
     if not torch.cuda.is_available():
         return 0
     try:
-        return int(torch.cuda.memory.max_memory_allocated())
-    except Exception:
-        try:
-            return int(torch.cuda.max_memory_allocated())
-        except Exception:
+        return int(torch.cuda.memory.max_memory_allocated(device))
+    except AttributeError:
+        legacy = getattr(torch.cuda, "max_memory_allocated", None)
+        if legacy is None:
             return 0
+        if device is None:
+            return int(legacy())
+        try:
+            return int(legacy(device))
+        except TypeError:
+            return int(legacy())
+
+
+def reset_peak_memory_stats() -> None:
+    """Legacy alias for :func:`reset_step_peak`."""
+
+    reset_step_peak()
+
+
+def max_memory_allocated() -> int:
+    """Legacy alias returning :func:`get_step_peak`."""
+
+    return get_step_peak()
 
 
 def mem_get_info() -> Optional[Tuple[int, int]]:
-    """Return (free_bytes, total_bytes) for current CUDA device, or None on CPU."""
-    if not torch.cuda.is_available():
-        return None
+    """Legacy alias for :func:`get_mem_info` returning ``None`` when CUDA is absent."""
+
     try:
-        free, total = torch.cuda.memory.mem_get_info()
-        return int(free), int(total)
-    except Exception:
-        try:
-            free, total = torch.cuda.mem_get_info()
-            return int(free), int(total)
-        except Exception:
-            return None
+        free, total = get_mem_info()
+    except RuntimeError:
+        return None
+    return (free, total)
 
 def headroom_frac():
     """Return [0..1] free/total headroom.
@@ -257,7 +298,7 @@ def headroom_frac():
     if torch.cuda.is_available():
         # 1) Try global device info (cudaMemGetInfo)
         try:
-            free, total = torch.cuda.memory.mem_get_info()
+            free, total = get_mem_info()
             if free > 0 and total > 0:
                 return free / total
         except Exception:
@@ -323,6 +364,9 @@ __all__ = [
     "sdpa_context",
     "te_prepare_fp8_modules",
     "te_fp8_autocast",
+    "get_mem_info",
+    "reset_step_peak",
+    "get_step_peak",
     "reset_peak_memory_stats",
     "max_memory_allocated",
     "mem_get_info",
@@ -330,3 +374,20 @@ __all__ = [
     "checkpoint_call",
     "timed_cuda",
 ]
+
+
+if __name__ == "__main__":
+    if not torch.cuda.is_available():
+        print("CUDA is not available; memory demo skipped.")
+    else:
+        dev = torch.cuda.current_device()
+        reset_step_peak(dev)
+        print(f"Initial peak bytes: {get_step_peak(dev)}")
+        first = torch.empty((1024,), device=dev)
+        print(f"Peak after first alloc: {get_step_peak(dev)}")
+        del first
+        reset_step_peak(dev)
+        print(f"Peak after reset: {get_step_peak(dev)}")
+        second = torch.empty((2048,), device=dev)
+        print(f"Peak after second alloc: {get_step_peak(dev)}")
+        del second
