@@ -24,6 +24,7 @@ runs.jsonl
 bench_results.jsonl
 grid_results.csv
 results/
+logs/
 
 .cache/
 datasets/
