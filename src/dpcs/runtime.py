@@ -356,6 +356,84 @@ def timed_cuda() -> float:
         except Exception:
             t[0] = 0.0
 
+def _distributed_backend():
+    """Return ``torch.distributed`` when available and initialized."""
+
+    dist = getattr(torch, "distributed", None)
+    if dist is None:
+        return None
+
+    is_available = getattr(dist, "is_available", None)
+    try:
+        if not callable(is_available) or not is_available():
+            return None
+    except Exception:
+        return None
+
+    is_initialized = getattr(dist, "is_initialized", None)
+    try:
+        if not callable(is_initialized) or not is_initialized():
+            return None
+    except Exception:
+        return None
+
+    return dist
+
+
+def dist_is_initialized() -> bool:
+    """Return ``True`` when :mod:`torch.distributed` is ready for collectives."""
+
+    return _distributed_backend() is not None
+
+
+def dist_get_rank(default: int = 0) -> int:
+    """Return the current rank when available, else ``default``."""
+
+    dist = _distributed_backend()
+    if dist is None:
+        return int(default)
+
+    get_rank = getattr(dist, "get_rank", None)
+    if not callable(get_rank):
+        return int(default)
+
+    try:
+        return int(get_rank())
+    except Exception:
+        return int(default)
+
+
+def dist_world_size(default: int = 1) -> int:
+    """Return world size when available, else ``default``."""
+
+    dist = _distributed_backend()
+    if dist is None:
+        return int(default)
+
+    get_world_size = getattr(dist, "get_world_size", None)
+    if not callable(get_world_size):
+        return int(default)
+
+    try:
+        return int(get_world_size())
+    except Exception:
+        return int(default)
+
+
+def dist_broadcast(tensor: torch.Tensor, src: int = 0) -> bool:
+    """Broadcast ``tensor`` from ``src`` rank when distributed is ready."""
+
+    dist = _distributed_backend()
+    if dist is None:
+        return False
+
+    try:
+        dist.broadcast(tensor, src=int(src))
+    except Exception:
+        return False
+    return True
+
+
 __all__ = [
     "amp_preferred_dtype",
     "amp_enabled",
@@ -371,6 +449,10 @@ __all__ = [
     "max_memory_allocated",
     "mem_get_info",
     "headroom_frac",
+    "dist_is_initialized",
+    "dist_get_rank",
+    "dist_world_size",
+    "dist_broadcast",
     "checkpoint_call",
     "timed_cuda",
 ]

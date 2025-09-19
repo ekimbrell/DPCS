@@ -31,6 +31,9 @@ from .runtime import (
     headroom_frac,
     te_prepare_fp8_modules,
     te_fp8_autocast,
+    dist_is_initialized,
+    dist_get_rank,
+    dist_broadcast,
 )
 
 # ------------------------ checkpointable leaf wrapper -----------------------
@@ -261,6 +264,17 @@ class DPCS:
         self._compat_states: List[_LeafState] = []
         self._registry: Mapping[nn.Module, _LeafState] = _StateRegistry([])
         self._leaf_names: List[str] = []
+        self._module_index: Dict[str, int] = {}
+        self._module_slots: List[int] = []
+        self._module_names_sorted: List[str] = []
+        self._decision_buffer: Optional[torch.Tensor] = None
+
+        tick_every = getattr(self.cfg, "tick_every", 1)
+        try:
+            tick_i = max(1, int(tick_every))
+        except Exception:
+            tick_i = 1
+        self._ddp_tick_every = tick_i
 
         # AMP mode string: "fp32" | "bf16" | "fp16" (with optional fp8 runtime wiring)
         self._amp_preferred_dtype = amp_preferred_dtype(self.cfg.device_type)
@@ -322,6 +336,8 @@ class DPCS:
         self._leaf_names = [w.leaf_name for w in leaves]
         self._compat_states = [_LeafState(self, i, w) for i, w in enumerate(leaves)]
         self._registry = _StateRegistry(self._compat_states)
+        self._decision_buffer = None
+        self._rebuild_module_index()
 
         # Optional TransformerEngine swap for FP8
         self._fp8_supported = False
@@ -480,6 +496,111 @@ class DPCS:
             return bool(blacklist.get(int(index), 0))
         return False
 
+    # ------------------------- distributed helpers ------------------------
+
+    def _rebuild_module_index(self) -> None:
+        names = list(self._leaf_names)
+        count = len(names)
+        if count == 0:
+            self._module_index = {}
+            self._module_slots = []
+            self._module_names_sorted = []
+            return
+
+        order = sorted(enumerate(names), key=lambda kv: (kv[1], kv[0]))
+        self._module_index = {name: slot for slot, (_idx, name) in enumerate(order)}
+        self._module_slots = [0] * count
+        self._module_names_sorted = [name for _idx, name in order]
+        for slot, (leaf_idx, _name) in enumerate(order):
+            if 0 <= leaf_idx < count:
+                self._module_slots[leaf_idx] = slot
+
+    @staticmethod
+    def _precision_to_bits(mode: str) -> int:
+        mapping = {"fp32": 0, "bf16": 1, "fp16": 2, "fp8": 3}
+        return mapping.get(str(mode).lower(), 0)
+
+    @staticmethod
+    def _bits_to_precision(bits: int) -> str:
+        mapping = {0: "fp32", 1: "bf16", 2: "fp16", 3: "fp8"}
+        return mapping.get(bits & 0b11, "fp32")
+
+    def _ensure_decision_buffer(self, count: int) -> torch.Tensor:
+        if count <= 0:
+            count = 1
+        device = torch.device("cpu")
+        if self.cfg.device_type == "cuda" and torch.cuda.is_available():
+            try:
+                device = torch.device(torch.cuda.current_device())
+            except Exception:
+                device = torch.device("cuda")
+        if (
+            self._decision_buffer is None
+            or self._decision_buffer.device != device
+            or self._decision_buffer.numel() != count
+        ):
+            try:
+                self._decision_buffer = torch.empty(count, dtype=torch.uint8, device=device)
+            except Exception:
+                self._decision_buffer = torch.empty(count, dtype=torch.uint8, device=torch.device("cpu"))
+        return self._decision_buffer
+
+    def _apply_decision_tensor(self, tensor: torch.Tensor) -> None:
+        if tensor.numel() == 0:
+            return
+        try:
+            base_val = int(tensor.view(-1)[0].item())
+        except Exception:
+            return
+
+        self._amp_mode = self._bits_to_precision(base_val & 0b11)
+
+        if not self._module_slots or not self._leaves:
+            self._ckpt_selected = set()
+            return
+
+        selected: set[int] = set()
+        for leaf_idx, slot in enumerate(self._module_slots):
+            if slot >= tensor.numel():
+                continue
+            try:
+                encoded = int(tensor[slot].item())
+            except Exception:
+                continue
+            use_ckpt = bool(encoded & 0b100)
+            self._leaves[leaf_idx].use_ckpt = use_ckpt
+            if use_ckpt:
+                selected.add(leaf_idx)
+        self._ckpt_selected = selected
+
+    def _broadcast_decisions(self) -> None:
+        if not dist_is_initialized():
+            return
+
+        count = max(1, len(self._module_slots))
+        tensor = self._ensure_decision_buffer(count)
+        rank = dist_get_rank(default=0)
+        base = self._precision_to_bits(self._amp_mode) & 0b11
+
+        with torch.no_grad():
+            if rank == 0:
+                tensor.fill_(base)
+                if self._module_slots:
+                    for leaf_idx, slot in enumerate(self._module_slots):
+                        value = base
+                        if leaf_idx < len(self._leaves) and self._leaves[leaf_idx].use_ckpt:
+                            value |= 0b100
+                        tensor[slot] = value
+                else:
+                    tensor[0] = base
+            else:
+                tensor.zero_()
+
+        if not dist_broadcast(tensor, src=0):
+            return
+
+        self._apply_decision_tensor(tensor)
+
     def _read_headroom(self) -> Optional[float]:
         if self._headroom_override is not None:
             try:
@@ -637,6 +758,9 @@ class DPCS:
                 self._ckpt_selected.clear()
                 for w in self._leaves:
                     w.use_ckpt = False
+
+        if (self._step % self._ddp_tick_every) == 0:
+            self._broadcast_decisions()
 
         # 5) Logging (optional)
         if self._log_path and (self._step % self._log_every == 0):
