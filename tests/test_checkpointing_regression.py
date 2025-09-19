@@ -35,8 +35,8 @@ def _clone_with_same_weights(model: nn.Module) -> nn.Module:
     return clone
 
 
-def _force_fp32_modes(sched: DPCS):
-    sched.force_fp32()
+def _force_precision_mode(sched: DPCS, mode: str = "fp32"):
+    sched.force_precision(mode)
 
 
 @pytest.mark.parametrize("device", ["cpu"])  # CUDA memory test is separate
@@ -62,8 +62,8 @@ def test_checkpointing_equivalence_numeric_cpu(device):
     model_base = sched_base.wrap(model_base)
     model_ckpt = sched_ckpt.wrap(model_ckpt)
 
-    _force_fp32_modes(sched_base)
-    _force_fp32_modes(sched_ckpt)
+    _force_precision_mode(sched_base)
+    _force_precision_mode(sched_ckpt)
 
     # Force checkpointing only for ckpt run
     sched_base._ckpt_on = False
@@ -93,12 +93,19 @@ def test_checkpointing_equivalence_numeric_cpu(device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for memory regression check")
-def test_checkpointing_reduces_peak_memory_cuda():
+@pytest.mark.parametrize("baseline_mode", ["bf16", "fp16"])
+def test_checkpointing_reduces_peak_memory_cuda(baseline_mode):
     """
     Compare peak CUDA memory (allocator) between baseline and checkpointed runs.
-    We hold precision at FP32 to isolate the effect of checkpointing.
+    Use explicit BF16/FP16 baselines to mirror "no precision" runs on GPUs.
     Success criterion: checkpointed peak memory must be at least 5% lower.
     """
+    if baseline_mode == "bf16":
+        try:
+            if not torch.cuda.is_bf16_supported():
+                pytest.skip("CUDA device does not support bfloat16")
+        except Exception:
+            pytest.skip("Unable to query bfloat16 support")
     set_seed(123)
     device = "cuda"
     width, depth, batch, classes = 8192, 10, 64, 1000
@@ -116,8 +123,8 @@ def test_checkpointing_reduces_peak_memory_cuda():
     model_base = sched_base.wrap(model_base)
     model_ckpt = sched_ckpt.wrap(model_ckpt)
 
-    _force_fp32_modes(sched_base)
-    _force_fp32_modes(sched_ckpt)
+    _force_precision_mode(sched_base, baseline_mode)
+    _force_precision_mode(sched_ckpt, baseline_mode)
 
     # Force checkpointing states explicitly
     sched_base._ckpt_on = False
@@ -160,4 +167,4 @@ def test_checkpointing_reduces_peak_memory_cuda():
     model_ckpt.zero_grad(set_to_none=True)
     lb = crit(model_base(x), y)
     lc = crit(model_ckpt(x), y)
-    assert torch.allclose(lb, lc, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(lb, lc, rtol=5e-3, atol=1e-5)
