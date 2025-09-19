@@ -23,7 +23,8 @@ All helpers gracefully degrade on older PyTorch versions.
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+import json
 import os
 import time
 
@@ -311,6 +312,85 @@ def headroom_frac():
         return free_like / max(total_phys, 1)
     return None
 
+# Logging helper -------------------------------------------------------------
+
+
+class JsonlLogger:
+    """Buffered JSONL writer.
+
+    Records are accumulated in-memory and written to disk in batches to avoid
+    per-step filesystem jitter. ``flush_every`` controls the batch size.
+    """
+
+    def __init__(self, path: str, *, flush_every: int = 20) -> None:
+        if not isinstance(path, str):
+            path = os.fspath(path)
+        self._path = path
+        try:
+            flush = int(flush_every)
+        except Exception:
+            flush = 20
+        self._flush_every = max(1, flush)
+        self._buffer: List[str] = []
+        self._closed = False
+        directory = os.path.dirname(self._path)
+        if directory:
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception:
+                pass
+
+    def _encode(self, record: Mapping[str, Any]) -> str:
+        try:
+            return json.dumps(dict(record))
+        except TypeError:
+            sanitized: Dict[str, Any] = {}
+            for key, value in dict(record).items():
+                try:
+                    json.dumps({key: value})
+                    sanitized[key] = value
+                except TypeError:
+                    sanitized[key] = repr(value)
+            return json.dumps(sanitized)
+
+    def log(self, record: Mapping[str, Any]) -> None:
+        if self._closed:
+            return
+        if not isinstance(record, Mapping):
+            return
+        try:
+            line = self._encode(record)
+        except Exception:
+            return
+        self._buffer.append(line)
+        if len(self._buffer) >= self._flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._closed or not self._buffer:
+            return
+        data = "\n".join(self._buffer) + "\n"
+        try:
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(data)
+        except Exception:
+            return
+        self._buffer.clear()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.flush()
+        finally:
+            self._closed = True
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
 # Checkpoint helper -----------------------------------------------------------
 
 def checkpoint_call(fn, *args, determinism_check: str = "none", **kwargs):
@@ -449,6 +529,7 @@ __all__ = [
     "max_memory_allocated",
     "mem_get_info",
     "headroom_frac",
+    "JsonlLogger",
     "dist_is_initialized",
     "dist_get_rank",
     "dist_world_size",

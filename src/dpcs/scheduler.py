@@ -12,7 +12,6 @@ It keeps the Python hot path small and avoids per-step dynamic allocations.
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-import json
 import math
 import os
 
@@ -29,6 +28,7 @@ from .runtime import (
     max_memory_allocated,
     mem_get_info,
     headroom_frac,
+    JsonlLogger,
     te_prepare_fp8_modules,
     te_fp8_autocast,
     dist_is_initialized,
@@ -382,6 +382,7 @@ class DPCS:
         # Logging
         self._log_path: Optional[str] = None
         self._log_every = max(1, int(self.cfg.log_every))
+        self._jsonl_logger: Optional[JsonlLogger] = None
 
         self._update_autocast()
 
@@ -452,11 +453,23 @@ class DPCS:
         return model
 
     def set_log_jsonl(self, path: str) -> None:
-        self._log_path = str(path)
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        except Exception:
-            pass
+        path_str = str(path)
+        self._log_path = path_str
+        if self._jsonl_logger is not None:
+            try:
+                self._jsonl_logger.close()
+            except Exception:
+                pass
+            self._jsonl_logger = None
+        if not path_str:
+            return
+        directory = os.path.dirname(path_str)
+        if directory:
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception:
+                pass
+        self._jsonl_logger = JsonlLogger(path_str, flush_every=20)
 
     def get_amp_config(self) -> Tuple[str, torch.dtype, bool]:
         device_type = self.cfg.device_type
@@ -854,17 +867,22 @@ class DPCS:
             self._broadcast_decisions()
 
         # 5) Logging (optional)
-        if self._log_path and (self._step % self._log_every == 0):
+        if self._jsonl_logger and (self._step % self._log_every == 0):
+            num_ckpt = int(sum(1 for w in self._leaves if w.use_ckpt))
+            precision_hist = self.precision_mix()
             rec = {
                 "step": int(self._step),
                 "headroom_frac": float(hr) if hr is not None else None,
                 "amp_mode": self._amp_mode,
                 "overflow": bool(overflow),
-                "ckpt_on": int(sum(1 for w in self._leaves if w.use_ckpt)),
+                "num_checkpointed": num_ckpt,
+                "ckpt_on": num_ckpt,
                 "num_leaves": int(len(self._leaves)),
+                "step_peak_bytes": int(peak_b),
                 "peak_alloc_bytes": int(peak_b),
                 "free_bytes": int(free_b) if free_b is not None else 0,
                 "total_bytes": int(total_b) if total_b is not None else 0,
+                "precision_mix": precision_hist,
                 "grad_var_avg": float(gvar) if gvar is not None else None,
                 "curv_avg": float(curv_avg) if curv_avg is not None else None,
             }
@@ -879,8 +897,7 @@ class DPCS:
                     for i in ids
                 ]
             try:
-                with open(self._log_path, "a") as f:
-                    f.write(json.dumps(rec) + "\n")
+                self._jsonl_logger.log(rec)
             except Exception:
                 pass
 
