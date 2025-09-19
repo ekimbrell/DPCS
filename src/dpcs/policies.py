@@ -12,8 +12,9 @@ Exported API:
               overflow: bool,
               current: str) -> str
 
-  - CheckpointPolicy(cfg)
-      .plan(act_bytes: list[int], fwd_ms: list[float], headroom: float | None) -> set[int]
+  - CheckpointPolicy(cfg, ckpt_cfg)
+      .plan(act_bytes_ema: list[float], headroom: float | None,
+            free_bytes: int | None, peak_bytes: int | None) -> set[int]
       .blacklist(bad_ids: list[int], penalty_steps: int = 50) -> None
       .tick() -> None   # decay blacklist counters per step
 
@@ -27,9 +28,9 @@ from typing import Iterable, List, Optional, Set
 import math
 
 try:  # type: ignore
-    from .config import DPCSConfig
+    from .config import DPCSConfig, CheckpointCfg
 except Exception:  # pragma: no cover
-    from config import DPCSConfig  # type: ignore
+    from config import DPCSConfig, CheckpointCfg  # type: ignore
 
 
 # ----------------------------- small helpers ------------------------------
@@ -191,14 +192,15 @@ class CheckpointPolicy:
     """Selects a subset of leaves to checkpoint under memory pressure.
 
     The policy exposes three primitives:
-      - ``plan``: rank leaves by benefit and return the top-K indices to enable
-        (K is derived from headroom and ``ckpt_topk_frac``).
+      - ``plan``: rank leaves by activation-byte EMA and choose a top-K under
+        current memory pressure.
       - ``blacklist``: temporarily prevent harmful ids from being re-enabled.
       - ``tick``: decay blacklist counters each step.
     """
 
-    def __init__(self, cfg: DPCSConfig) -> None:
+    def __init__(self, cfg: DPCSConfig, ckpt_cfg: CheckpointCfg) -> None:
         self.cfg = cfg
+        self.ckpt_cfg = ckpt_cfg
         self._blacklist: dict[int, int] = {}  # id -> remaining penalty steps
         self._pat_cnt: int = 0
         self._last_target: Set[int] = set()
@@ -221,48 +223,63 @@ class CheckpointPolicy:
             self._blacklist.pop(k, None)
 
     # ---- core decision ----
-    def plan(self, act_bytes: List[int], fwd_ms: List[float], headroom: Optional[float]) -> Set[int]:
+    def _compute_pressure(
+        self, headroom: Optional[float], free_bytes: Optional[int], peak_bytes: Optional[int]
+    ) -> float:
+        pressure = 0.0
+        if headroom is not None:
+            hr = _clamp01(headroom)
+            lo = float(self.cfg.low_headroom_frac)
+            hi = float(self.cfg.hi_headroom_frac)
+            if hr <= lo:
+                pressure = 1.0
+            elif hr < hi:
+                span = max(hi - lo, 1e-6)
+                pressure = max(pressure, (hi - hr) / span)
+        if free_bytes is not None and peak_bytes is not None and peak_bytes > 0:
+            ratio = float(free_bytes) / max(float(peak_bytes), 1.0)
+            ratio = max(0.0, min(ratio, 1.0))
+            pressure = max(pressure, 1.0 - ratio)
+        return max(0.0, min(pressure, 1.0))
+
+    def plan(
+        self,
+        act_bytes: List[float],
+        headroom: Optional[float],
+        free_bytes: Optional[int],
+        peak_bytes: Optional[int],
+    ) -> Set[int]:
         n = len(act_bytes)
         if n == 0:
-            return set()
-        hr = _clamp01(headroom)
+            self._last_target = set()
+            return self._last_target
 
-        # Determine target fraction based on headroom
-        if hr >= self.cfg.hi_headroom_frac:
-            frac = 0.0
-        elif hr >= self.cfg.low_headroom_frac:
-            frac = float(self.cfg.ckpt_topk_frac) * 0.5
-        else:
-            frac = float(self.cfg.ckpt_topk_frac)
-
-        k = int(math.ceil(frac * n))
+        pressure = self._compute_pressure(headroom, free_bytes, peak_bytes)
+        cap = max(0.0, min(float(self.ckpt_cfg.max_fraction), 1.0))
+        cfg_cap = float(self.cfg.ckpt_topk_frac)
+        if cfg_cap > 0.0:
+            cap = min(cap, cfg_cap)
+        target_frac = cap * pressure
+        k = int(math.ceil(target_frac * n))
         if k <= 0:
             self._last_target = set()
             return self._last_target
 
-        # Compute benefit score
-        scores: List[float] = []
-        use_benefit = bool(self.cfg.ckpt_use_benefit_score)
-        for b, t in zip(act_bytes, fwd_ms):
-            if not use_benefit:
-                scores.append(float(b))
-            else:
-                ms = float(t) if t is not None else 0.0
-                s = (float(b) / max(1e-3, ms)) if ms > 0.0 else float(b)
-                scores.append(s)
+        scores = [float(b) for b in act_bytes]
 
-        # Filter by min activation bytes and blacklist
-        candidates = [i for i, b in enumerate(act_bytes)
-                      if b >= int(self.cfg.min_activation_bytes_to_ckpt) and (i not in self._blacklist)]
+        min_bytes = int(self.cfg.min_activation_bytes_to_ckpt)
+        candidates = [
+            i
+            for i, b in enumerate(act_bytes)
+            if float(b) >= min_bytes and (i not in self._blacklist)
+        ]
         if not candidates:
             self._last_target = set()
             return self._last_target
 
-        # Select top-k among candidates
         candidates.sort(key=lambda i: scores[i], reverse=True)
         chosen = set(candidates[:k])
 
-        # Patience against thrashing: change only after ckpt_patience steps
         if self._pat_cnt < max(1, int(self.cfg.ckpt_patience)):
             self._pat_cnt += 1
             return self._last_target

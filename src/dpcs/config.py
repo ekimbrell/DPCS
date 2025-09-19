@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict
-import math
 import torch
 
 
@@ -163,4 +162,18 @@ class TelemetryCfg:
     enable_timing: bool = False
 
 
-__all__ = ["DPCSConfig", "TelemetryCfg"]
+@dataclass(frozen=True)
+class CheckpointCfg:
+    """Lightweight knobs for activation checkpointing wrappers."""
+
+    preserve_rng_state: bool = True
+    use_reentrant: bool = False
+    max_fraction: float = 0.5
+
+    def __post_init__(self) -> None:  # pragma: no cover - trivial setters
+        object.__setattr__(self, "preserve_rng_state", bool(self.preserve_rng_state))
+        object.__setattr__(self, "use_reentrant", bool(self.use_reentrant))
+        object.__setattr__(self, "max_fraction", float(_clip01(float(self.max_fraction))))
+
+
+__all__ = ["DPCSConfig", "TelemetryCfg", "CheckpointCfg"]

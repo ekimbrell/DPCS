@@ -7,6 +7,6 @@ scripts may still import :mod:`dpcs.dpcs`, so re-export the public API here.
 from __future__ import annotations
 
 from .scheduler import DPCS
-from .config import DPCSConfig
+from .config import DPCSConfig, CheckpointCfg
 
-__all__ = ["DPCS", "DPCSConfig"]
+__all__ = ["DPCS", "DPCSConfig", "CheckpointCfg"]
