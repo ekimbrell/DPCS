@@ -45,78 +45,45 @@ def _clamp01(x: float | None) -> float:
     return float(x)
 
 
-@dataclass
-class _Patience:
-    enter: int
-    exit: int
-    cnt: int = 0
-    state: bool = False
-
-    def update(self, want_on: bool) -> bool:
-        """Hysteresis with separate enter/exit patience.
-        Returns current state after update.
-        """
-        if want_on == self.state:
-            self.cnt = 0
-            return self.state
-        self.cnt += 1
-        need = self.enter if want_on else self.exit
-        if self.cnt >= max(1, need):
-            self.state = want_on
-            self.cnt = 0
-        return self.state
-
-
 # ----------------------------- Precision policy ---------------------------
+
+@dataclass(frozen=True)
+class PrecisionCfg:
+    """Lightweight knobs for the conservative precision policy."""
+
+    prefer_bf16: bool = True
+    patience: int = 8
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prefer_bf16", bool(self.prefer_bf16))
+        object.__setattr__(self, "patience", max(1, int(self.patience)))
+
 
 class PrecisionPolicy:
     """Finite-state policy for AMP mode selection.
 
-    Modes: "fp32", "bf16", "fp16", optionally "fp8" when supported by the
-    runtime helper. The policy still governs the global precision mode
-    while the runtime swaps FP8-capable modules when requested.
-
-    Signals considered:
-      - ``headroom``: free/total VRAM fraction (0..1). Low headroom → lower precision.
-      - ``grad_var``: EMA of gradient variance. Low → lower precision safe; high → promote.
-      - ``curvature``: optional curvature proxy (e.g., power-iter HVP eigval). High → promote.
-      - ``overflow``: GradScaler overflow → immediate fp32 cooldown.
+    Modes: "fp32", "bf16", "fp16". FP8 support is intentionally not wired for
+    the conservative "v0" policy; once the system has gathered enough stable
+    steps it demotes from fp32 to the preferred low-precision mode (bf16 when
+    available, otherwise fp16). Any overflow observation triggers an immediate
+    promotion back to fp32 with a short cooldown window to reassess stability.
     """
 
-    def __init__(self, cfg: DPCSConfig, bf16_supported: bool, fp8_supported: bool = False) -> None:
+    def __init__(self, cfg: PrecisionCfg, bf16_supported: bool, amp_available: bool = True) -> None:
         self.cfg = cfg
+        self.amp_available = bool(amp_available)
         self.bf16_supported = bool(bf16_supported)
-        self.fp8_supported = bool(fp8_supported)
+        self.low_mode = "fp32"
+        if self.amp_available:
+            if self.bf16_supported and self.cfg.prefer_bf16:
+                self.low_mode = "bf16"
+            else:
+                self.low_mode = "fp16"
         self.cooldown = 0
-        self.pat = _Patience(enter=max(1, cfg.mode_patience), exit=max(1, cfg.mode_patience))
-        # When an overflow triggers a forced fp32 interval we keep track of it so
-        # we can immediately return to a lower mode once conditions are safe
-        # again (e.g., low headroom or tame gradients).
-        self._force_fp32_until_safe = False
-
-    def _lower_mode(self) -> str:
-        # prefer fp8 when available, then bf16, else fp16
-        if self.fp8_supported:
-            return "fp8"
-        if self.bf16_supported:
-            return "bf16"
-        return "fp16"
-
-    def _promote_mode(self, current: str) -> str:
-        if current == "fp32":
-            return "fp32"
-        if current == "fp8":
-            if self.bf16_supported:
-                return "bf16"
-            return "fp32"
-        if current == "bf16":
-            return "fp32"
-        if current == "fp16":
-            return "fp32"
-        return "fp32"
-
-    def update_fp8_support(self, supported: bool) -> None:
-        self.fp8_supported = bool(supported)
+        patience = max(1, int(self.cfg.patience))
+        half = patience // 2
+        self._cooldown_window = max(1, min(2, max(1, half)))
+        self._stable_steps = 0
 
     def decide(
         self,
@@ -126,64 +93,35 @@ class PrecisionPolicy:
         overflow: bool,
         current: str,
     ) -> str:
-        # 1) Overflow → force fp32 for a cooldown window
+        del headroom, grad_var, curvature  # unused in the conservative policy
+        if not self.amp_available or self.low_mode == "fp32":
+            self.cooldown = 0
+            self._stable_steps = 0
+            return "fp32"
+
+        mode = str(current).lower()
         if overflow:
-            self.cooldown = max(self.cooldown, 8)
-            self._force_fp32_until_safe = True
+            self.cooldown = self._cooldown_window
+            self._stable_steps = 0
             return "fp32"
 
-        if self.cooldown > 0:
-            self.cooldown -= 1
-            return "fp32"
+        if mode != "fp32" and mode not in {"bf16", "fp16"}:
+            mode = "fp32"
 
-        # 2) Combine signals
-        hr = _clamp01(headroom)
-        gv = 0.0 if (grad_var is None) else float(grad_var)
-        curv = 0.0 if (curvature is None) else float(curvature)
-        low_headroom = hr < self.cfg.low_headroom_frac
-        safe_signals = (
-            (grad_var is None or gv <= self.cfg.epsilon_g_low)
-            and (curvature is None or curv <= self.cfg.kappa_low)
-        )
-
-
-        want_low = low_headroom or (gv < self.cfg.epsilon_g_low and curv < self.cfg.kappa_low)
-        want_high = (hr > self.cfg.hi_headroom_frac) or (gv > self.cfg.epsilon_g_high or curv > self.cfg.kappa_high)
-
-        if self._force_fp32_until_safe:
-            if low_headroom or safe_signals:
-                # Drop back to the preferred lower mode immediately after the
-                # overflow-induced cooldown finishes. Also reset patience so the
-                # lower mode sticks unless high-pressure signals appear.
-                self._force_fp32_until_safe = False
-                self.pat.state = True
-                self.pat.cnt = 0
-                return self._lower_mode()
-            if want_high and not want_low:
-                # If we are seeing strong signals to remain in higher precision
-                # stop treating the current fp32 mode as overflow-forced.
-                self._force_fp32_until_safe = False
+        if mode == "fp32":
+            if self.cooldown > 0:
+                self.cooldown -= 1
+                self._stable_steps = 0
                 return "fp32"
-            # Otherwise keep the current mode (typically fp32) until safety
-            # conditions are met.
-            return current
+            self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+            if self._stable_steps >= self.cfg.patience:
+                return self.low_mode
+            return "fp32"
 
-
-        # 3) Apply hysteresis: if neither strongly wants change, keep current
-        if want_low and not want_high:
-            self.pat.update(True)
-            target = self._lower_mode()
-        elif want_high and not want_low:
-            self.pat.update(False)
-            target = self._promote_mode(current)
-        else:
-            # ambiguous; keep current
-            return current
-
-        # Enforce patience to avoid thrash
-        if self.pat.state:
-            return target
-        return current
+        # Already running in low precision. Stay there unless a new overflow occurs.
+        self.cooldown = 0
+        self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+        return self.low_mode
 
 
 # --------------------------- Checkpointing policy --------------------------
