@@ -22,8 +22,9 @@ All helpers gracefully degrade on older PyTorch versions.
 """
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
 import json
 import os
 import time
@@ -85,6 +86,173 @@ def amp_uses_grad_scaler(dtype: torch.dtype, device_type: str = "cuda") -> bool:
     bf16 generally does *not* require loss scaling; fp32 doesn't use AMP.
     """
     return _is_cuda(device_type) and (dtype is torch.float16)
+
+
+def grad_scaler_get_scale(scaler: Optional[torch.amp.GradScaler]) -> Optional[float]:
+    """Return the current scale from ``GradScaler.get_scale`` when available."""
+
+    if scaler is None:
+        return None
+    get_scale = getattr(scaler, "get_scale", None)
+    if get_scale is None or not callable(get_scale):
+        return None
+    try:
+        value = get_scale()
+    except Exception:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        try:
+            return float(value.item())  # type: ignore[union-attr]
+        except Exception:
+            return None
+
+
+def grad_scaler_found_inf(scaler: Optional[torch.amp.GradScaler]) -> Optional[bool]:
+    """Inspect ``GradScaler`` internal ``found_inf`` flags.
+
+    Returns ``True`` when any optimizer recorded overflow in the current step,
+    ``False`` when checks were performed and no overflow was observed, and
+    ``None`` when the information is unavailable (older PyTorch or disabled
+    scaler).
+    """
+
+    if scaler is None:
+        return None
+    per_opt = getattr(scaler, "_per_optimizer_states", None)
+    seen = False
+
+    if isinstance(per_opt, Mapping):
+        try:
+            states = list(per_opt.values())
+        except Exception:
+            states = []
+        for state in states:
+            if not isinstance(state, Mapping):
+                continue
+            found_map = state.get("found_inf_per_device")
+            if not isinstance(found_map, Mapping):
+                continue
+            for found_inf in list(found_map.values()):
+                seen = True
+                try:
+                    if float(found_inf) != 0.0:
+                        return True
+                except Exception:
+                    try:
+                        if bool(found_inf):
+                            return True
+                    except Exception:
+                        continue
+        if seen:
+            return False
+    return None
+
+
+class AmpOverflowMonitor:
+    """Context manager tracking ``GradScaler`` overflow observations.
+
+    The monitor wraps :meth:`GradScaler.update` and records whether overflow was
+    detected via ``found_inf`` flags or scale drops. A bounded history keeps the
+    last ``history`` observations, enabling ``overflow_recent(K)`` queries.
+    """
+
+    def __init__(
+        self,
+        scaler: torch.amp.GradScaler,
+        *,
+        history: int = 4,
+        on_overflow: Optional[Callable[[bool], None]] = None,
+    ) -> None:
+        if scaler is None:
+            raise TypeError("scaler must be a GradScaler instance")
+        self._scaler = scaler
+        try:
+            hist = int(history)
+        except Exception:
+            hist = 4
+        self._history_len = max(1, hist)
+        self._history: Deque[bool] = deque(maxlen=self._history_len)
+        self._scale_before: Optional[float] = None
+        self._found_inf_before: Optional[bool] = None
+        self._last_overflow: bool = False
+        self._last_scale: Optional[float] = grad_scaler_get_scale(scaler)
+        self._active = False
+        self._callback = on_overflow
+
+    @property
+    def scaler(self) -> torch.amp.GradScaler:
+        return self._scaler
+
+    @property
+    def last_overflow(self) -> bool:
+        return bool(self._last_overflow)
+
+    @property
+    def last_scale(self) -> Optional[float]:
+        return self._last_scale
+
+    @property
+    def history(self) -> Tuple[bool, ...]:
+        return tuple(self._history)
+
+    def overflow_recent(self, steps: Optional[int] = None) -> bool:
+        if not self._history:
+            return bool(self._last_overflow) if steps is None or steps > 0 else False
+        if steps is None:
+            limit = len(self._history)
+        else:
+            try:
+                limit = max(1, int(steps))
+            except Exception:
+                limit = len(self._history)
+        count = 0
+        for flag in reversed(self._history):
+            if flag:
+                return True
+            count += 1
+            if count >= limit:
+                break
+        return False
+
+    def _record(self, overflow: bool) -> None:
+        flag = bool(overflow)
+        self._last_overflow = flag
+        self._history.append(flag)
+        if self._callback is not None:
+            try:
+                self._callback(flag)
+            except Exception:
+                pass
+
+    def __enter__(self) -> torch.amp.GradScaler:
+        if self._active:
+            return self._scaler
+        self._active = True
+        self._scale_before = grad_scaler_get_scale(self._scaler)
+        self._found_inf_before = grad_scaler_found_inf(self._scaler)
+        return self._scaler
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        scale_after = grad_scaler_get_scale(self._scaler)
+        found_inf_after = grad_scaler_found_inf(self._scaler)
+        overflow = False
+        if self._found_inf_before is True or found_inf_after is True:
+            overflow = True
+        elif (
+            self._scale_before is not None
+            and scale_after is not None
+            and scale_after < self._scale_before
+        ):
+            overflow = True
+        self._scale_before = None
+        self._found_inf_before = None
+        self._active = False
+        if scale_after is not None:
+            self._last_scale = scale_after
+        self._record(overflow)
+        return False
 
 # SDPA helpers ----------------------------------------------------------------
 
@@ -518,6 +686,9 @@ __all__ = [
     "amp_preferred_dtype",
     "amp_enabled",
     "amp_uses_grad_scaler",
+    "grad_scaler_get_scale",
+    "grad_scaler_found_inf",
+    "AmpOverflowMonitor",
     "sdpa_backends_normalize",
     "sdpa_context",
     "te_prepare_fp8_modules",
