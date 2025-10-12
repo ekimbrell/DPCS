@@ -22,12 +22,14 @@ from .config import DPCSConfig, CheckpointCfg
 from .policies import PrecisionPolicy, CheckpointPolicy, PrecisionCfg
 from .signals import GradSignals, CurvatureSignals, EMA, tensor_bytes
 from .runtime import (
+    AmpOverflowMonitor,
     amp_preferred_dtype,
     amp_uses_grad_scaler,
     reset_peak_memory_stats,
     max_memory_allocated,
     mem_get_info,
     headroom_frac,
+    grad_scaler_get_scale,
     JsonlLogger,
     te_prepare_fp8_modules,
     te_fp8_autocast,
@@ -167,45 +169,6 @@ def _wrap_leaves(model: nn.Module, ckpt_cfg: CheckpointCfg) -> Tuple[nn.Module, 
 
 
 # --------------------------- compatibility views -----------------------------
-
-
-class AmpOverflowMonitor:
-    """Context manager that records GradScaler scale changes around ``update``."""
-
-    def __init__(self, scheduler: "DPCS", scaler: torch.amp.GradScaler) -> None:
-        self._scheduler = scheduler
-        self._scaler = scaler
-        self._scale_before: Optional[float] = None
-
-    def _read_scale(self) -> Optional[float]:
-        scaler = self._scaler
-        if scaler is None:
-            return None
-        get_scale = getattr(scaler, "get_scale", None)
-        if get_scale is None or not callable(get_scale):
-            return None
-        try:
-            return float(get_scale())
-        except Exception:
-            return None
-
-    def __enter__(self) -> torch.amp.GradScaler:
-        self._scale_before = self._read_scale()
-        return self._scaler
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        scale_after = self._read_scale()
-        before = self._scale_before
-        self._scale_before = None
-        if (
-            before is not None
-            and scale_after is not None
-            and scale_after < before
-        ):
-            self._scheduler._amp_overflow = True
-        return False
-
-
 class _LeafState:
     """Lightweight compatibility view of a wrapped module's state."""
 
@@ -385,7 +348,10 @@ class DPCS:
 
         # Overflow tracking
         self._last_scale: Optional[float] = None
-        self._amp_overflow: bool = False
+        patience = max(1, int(self._prec_cfg.patience))
+        self._overflow_recent_window = max(2, min(8, patience))
+        self._overflow_monitors: Dict[int, AmpOverflowMonitor] = {}
+        self._overflow_recent_flag: bool = False
 
         # Logging
         self._log_path: Optional[str] = None
@@ -506,6 +472,19 @@ class DPCS:
     def amp_dtype(self) -> torch.dtype:
         _, dtype, _ = self.get_amp_config()
         return dtype
+
+    def amp_overflow_recent(self, steps: Optional[int] = None) -> bool:
+        if steps is None:
+            limit = self._overflow_recent_window
+        else:
+            try:
+                limit = max(1, int(steps))
+            except Exception:
+                limit = self._overflow_recent_window
+        for monitor in list(self._overflow_monitors.values()):
+            if monitor.overflow_recent(limit):
+                return True
+        return bool(self._overflow_recent_flag) if limit > 0 else False
 
     def precision_mix(self) -> Dict[str, int]:
         mode = self._effective_amp_mode()
@@ -729,10 +708,13 @@ class DPCS:
     def overflow_monitor(self, scaler: torch.amp.GradScaler) -> AmpOverflowMonitor:
         if scaler is None:
             raise TypeError("scaler must be a GradScaler instance")
-        return AmpOverflowMonitor(self, scaler)
+        monitor = self._overflow_monitors.get(id(scaler))
+        if monitor is None or monitor.scaler is not scaler:
+            monitor = AmpOverflowMonitor(scaler, history=self._overflow_recent_window)
+            self._overflow_monitors[id(scaler)] = monitor
+        return monitor
 
     def start_step(self) -> None:
-        self._amp_overflow = False
         # Step-scoped peak VRAM reset
         reset_peak_memory_stats()
         # Decay blacklist counters for ckpt policy
@@ -817,24 +799,44 @@ class DPCS:
             free_b, total_b = info
         peak_b = max_memory_allocated()
 
-        # 2) Detect AMP overflow via GradScaler scale drop
-        overflow = bool(self._amp_overflow)
-        self._amp_overflow = False
-        if scaler is not None and getattr(scaler, "is_enabled", lambda: False)():
-            try:
-                curr = float(scaler.get_scale())
-                if self._last_scale is not None and curr < self._last_scale:
-                    overflow = True
-                self._last_scale = curr
-            except Exception:
-                pass
-        elif scaler is not None:
-            try:
-                self._last_scale = float(scaler.get_scale())
-            except Exception:
-                self._last_scale = None
-        else:
+        # 2) Detect AMP overflow via GradScaler signals
+        overflow = False
+        overflow_recent = False
+        monitor = None
+        if scaler is not None:
+            monitor = self._overflow_monitors.get(id(scaler))
+        if monitor is not None:
+            overflow = monitor.last_overflow
+            overflow_recent = monitor.overflow_recent(self._overflow_recent_window)
+            last_scale = monitor.last_scale
+            if last_scale is not None:
+                self._last_scale = last_scale
+
+        scaler_enabled = False
+        curr_scale: Optional[float] = None
+        if scaler is not None:
+            is_enabled = getattr(scaler, "is_enabled", None)
+            if callable(is_enabled):
+                try:
+                    scaler_enabled = bool(is_enabled())
+                except Exception:
+                    scaler_enabled = False
+            curr_scale = grad_scaler_get_scale(scaler)
+
+        if scaler_enabled and curr_scale is not None:
+            if self._last_scale is not None and curr_scale < self._last_scale:
+                overflow = True
+            self._last_scale = curr_scale
+        elif scaler is None:
             self._last_scale = None
+        elif curr_scale is not None:
+            self._last_scale = curr_scale
+        elif scaler is not None and not scaler_enabled:
+            self._last_scale = None
+
+        if overflow:
+            overflow_recent = True
+        self._overflow_recent_flag = overflow_recent
 
         # 3) Precision policy (global)
         gvar = self._grads.grad_var_avg() if self._grads is not None else None
