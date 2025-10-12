@@ -53,10 +53,20 @@ class PrecisionCfg:
 
     prefer_bf16: bool = True
     patience: int = 8
+    cooldown_steps: int = 2
+    bf16_entry_headroom: float = 0.18
+    bf16_exit_headroom: float = 0.08
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prefer_bf16", bool(self.prefer_bf16))
         object.__setattr__(self, "patience", max(1, int(self.patience)))
+        object.__setattr__(self, "cooldown_steps", max(1, int(self.cooldown_steps)))
+        entry = _clamp01(self.bf16_entry_headroom)
+        exit_ = _clamp01(self.bf16_exit_headroom)
+        if exit_ > entry:
+            entry, exit_ = exit_, entry
+        object.__setattr__(self, "bf16_entry_headroom", entry)
+        object.__setattr__(self, "bf16_exit_headroom", exit_)
 
 
 class PrecisionPolicy:
@@ -82,9 +92,9 @@ class PrecisionPolicy:
                 self.low_mode = "fp16"
         self.cooldown = 0
         patience = max(1, int(self.cfg.patience))
-        half = patience // 2
-        self._cooldown_window = max(1, min(2, max(1, half)))
+        self._cooldown_window = max(1, int(self.cfg.cooldown_steps))
         self._stable_steps = 0
+        self._active_low_mode = self.low_mode
         # FP8 gating (configured lazily by the scheduler)
         self._fp8_supported = False
         self._fp8_low_headroom = 0.05
@@ -132,6 +142,8 @@ class PrecisionPolicy:
         if overflow:
             self.cooldown = self._cooldown_window
             self._stable_steps = 0
+            if self.low_mode == "bf16" and self.amp_available:
+                self._active_low_mode = "fp16"
             if mode == "fp8":
                 self._fp8_reentry_cooldown = max(self._fp8_reentry_cooldown, self._cooldown_window)
             return "fp32"
@@ -143,6 +155,12 @@ class PrecisionPolicy:
 
         fp8_supported = self._fp8_supported and self.amp_available
         hr = None if headroom is None else float(headroom)
+
+        if self.low_mode == "bf16" and self.amp_available and hr is not None:
+            if self._active_low_mode == "bf16" and hr <= self.cfg.bf16_exit_headroom:
+                self._active_low_mode = "fp16"
+            elif self._active_low_mode == "fp16" and hr >= self.cfg.bf16_entry_headroom:
+                self._active_low_mode = "bf16"
 
         if not fp8_supported and mode == "fp8":
             mode = "fp32"
@@ -177,12 +195,16 @@ class PrecisionPolicy:
                 return "fp32"
             self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
             if self._stable_steps >= self.cfg.patience:
+                if self.low_mode == "bf16":
+                    return self._active_low_mode
                 return self.low_mode
             return "fp32"
 
         # Already running in low precision. Stay there unless a new overflow occurs.
         self.cooldown = 0
         self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+        if self.low_mode == "bf16":
+            return self._active_low_mode
         return self.low_mode
 
 
@@ -289,4 +311,4 @@ class CheckpointPolicy:
         return chosen
 
 
-__all__ = ["PrecisionPolicy", "CheckpointPolicy"]
+__all__ = ["PrecisionCfg", "PrecisionPolicy", "CheckpointPolicy"]

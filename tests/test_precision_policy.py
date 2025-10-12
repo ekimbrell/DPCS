@@ -39,7 +39,7 @@ def test_policy_overflow_forces_cooldown() -> None:
 
     mode = pol.decide(None, None, None, True, mode)
     assert mode == "fp32"
-    assert pol.cooldown == 2
+    assert pol.cooldown == cfg.cooldown_steps
 
     while pol.cooldown > 0:
         prev_cd = pol.cooldown
@@ -48,10 +48,31 @@ def test_policy_overflow_forces_cooldown() -> None:
         assert pol.cooldown == max(prev_cd - 1, 0)
 
     for _ in range(cfg.patience - 1):
-        mode = pol.decide(None, None, None, False, mode)
+        mode = pol.decide(0.25, None, None, False, mode)
         assert mode == "fp32"
 
-    mode = pol.decide(None, None, None, False, mode)
+    mode = pol.decide(0.25, None, None, False, mode)
+    assert mode == "bf16"
+
+
+def test_policy_prefers_bf16_with_hysteresis() -> None:
+    cfg = PrecisionCfg(patience=2, bf16_entry_headroom=0.2, bf16_exit_headroom=0.1)
+    pol = PrecisionPolicy(cfg, bf16_supported=True, amp_available=True)
+    mode = "fp32"
+
+    mode = pol.decide(0.3, None, None, False, mode)
+    assert mode == "fp32"
+    mode = pol.decide(0.3, None, None, False, mode)
+    assert mode == "bf16"
+
+    # Drop headroom below the exit threshold -> fall back to fp16.
+    mode = pol.decide(0.05, None, None, False, mode)
+    assert mode == "fp16"
+
+    # Stay in fp16 until headroom rises above the entry threshold.
+    mode = pol.decide(0.15, None, None, False, mode)
+    assert mode == "fp16"
+    mode = pol.decide(0.25, None, None, False, mode)
     assert mode == "bf16"
 
 
