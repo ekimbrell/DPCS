@@ -668,17 +668,101 @@ def dist_world_size(default: int = 1) -> int:
         return int(default)
 
 
-def dist_broadcast(tensor: torch.Tensor, src: int = 0) -> bool:
-    """Broadcast ``tensor`` from ``src`` rank when distributed is ready."""
+_BROADCAST_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+def _broadcast_state_key(group: Optional[Any]) -> int:
+    return id(group) if group is not None else -1
+
+
+def dist_broadcast(obj: torch.Tensor, group: Optional[Any] = None) -> bool:
+    """Broadcast ``obj`` from rank 0 with a strict participation contract.
+
+    The helper coordinates a per-step rendezvous that first synchronizes all
+    ranks via :func:`torch.distributed.barrier` followed by a lightweight
+    ``all_reduce`` on a monotonically increasing step counter. Any mismatch in
+    participation (e.g. a missing rank) triggers a descriptive ``RuntimeError``
+    rather than hanging indefinitely.
+
+    Parameters
+    ----------
+    obj:
+        Tensor to broadcast. Rank 0 is treated as the source and must populate
+        ``obj`` before calling.
+    group:
+        Optional process group to use. ``None`` defaults to the global group.
+
+    Returns
+    -------
+    bool
+        ``True`` when a distributed backend was available and the broadcast was
+        performed. ``False`` when :mod:`torch.distributed` is unavailable.
+    """
 
     dist = _distributed_backend()
     if dist is None:
         return False
 
+    backend = str(dist.get_backend(group=group)).lower()
+    world_size = int(dist.get_world_size(group=group))
+
+    if world_size <= 1:
+        dist.broadcast(obj, src=0, group=group)
+        return True
+
+    if backend == "nccl":
+        if not obj.is_cuda:
+            raise RuntimeError(
+                "dist_broadcast requires CUDA tensors when using the NCCL backend"
+            )
+        device = obj.device
+    else:
+        device = torch.device("cpu")
+
+    key = _broadcast_state_key(group)
+    state = _BROADCAST_STATE.get(key)
+    if state is None or state.get("device") != device:
+        step_tensor = torch.zeros(1, dtype=torch.long, device=device)
+        state = {"step": 0, "tensor": step_tensor, "device": device}
+        _BROADCAST_STATE[key] = state
+
+    step_tensor = state["tensor"]
+    state["step"] = int(state.get("step", 0)) + 1
+    step = state["step"]
+    step_tensor.fill_(step)
+
     try:
-        dist.broadcast(tensor, src=int(src))
-    except Exception:
-        return False
+        dist.barrier(group=group)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"DPCS dist_broadcast barrier failed at step {step}: "
+            "ensure all ranks call dist_broadcast each step"
+        ) from exc
+
+    try:
+        dist.all_reduce(step_tensor, group=group)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"DPCS dist_broadcast participation check failed at step {step}: "
+            "all_reduce did not complete"
+        ) from exc
+
+    total = int(step_tensor.item())
+    expected = step * world_size
+    if total != expected:
+        raise RuntimeError(
+            "DPCS dist_broadcast participation check failed at step "
+            f"{step}: expected sum {expected}, got {total}. "
+            "Ensure every rank calls dist_broadcast once per scheduler step."
+        )
+
+    step_tensor.fill_(step)
+
+    try:
+        dist.broadcast(obj, src=0, group=group)
+    except RuntimeError as exc:
+        raise RuntimeError("DPCS dist_broadcast failed during broadcast") from exc
+
     return True
 
 
