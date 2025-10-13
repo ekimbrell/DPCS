@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 import json
 import math
 import os
@@ -485,6 +485,248 @@ def headroom_frac():
 # Logging helper -------------------------------------------------------------
 
 
+TELEMETRY_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "step": {"types": (int,), "required": True},
+    "broadcast_step": {"types": (int,), "required": True},
+    "headroom_frac": {"types": (float, type(None)), "required": True},
+    "amp_mode": {"types": (str,), "required": True},
+    "overflow": {"types": (bool,), "required": True},
+    "overflow_flag": {"types": (bool,), "required": True},
+    "cooldown_remaining": {"types": (int,), "required": True},
+    "num_checkpointed": {"types": (int,), "required": True},
+    "ckpt_on": {"types": (bool,), "required": True},
+    "num_leaves": {"types": (int,), "required": True},
+    "step_peak_bytes": {"types": (int,), "required": True},
+    "peak_alloc_bytes": {"types": (int,), "required": True},
+    "allocated": {"types": (int, type(None)), "required": True},
+    "reserved": {"types": (int, type(None)), "required": True},
+    "active": {"types": (int, type(None)), "required": True},
+    "fragmentation_hint": {"types": (float, type(None)), "required": True},
+    "device_free": {"types": (int, type(None)), "required": True},
+    "device_total": {"types": (int, type(None)), "required": True},
+    "precision_mix": {"types": (Mapping,), "required": True},
+    "grad_var_avg": {"types": (float, type(None)), "required": False},
+    "curv_avg": {"types": (float, type(None)), "required": False},
+    "ckpt_ids": {"types": (Sequence,), "required": False},
+    "ckpt_modules": {"types": (Sequence,), "required": False},
+    "graph_breaks_total": {"types": (int,), "required": False},
+    "top_break_reasons": {"types": (Sequence,), "required": False},
+}
+
+
+def _is_int_like(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_float_like(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (float, int))
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if _is_int_like(value):
+        return int(value)
+    try:
+        coerced = int(value)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    return coerced
+
+
+def _sanitize_precision_mix(value: Any) -> Dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise TypeError("precision_mix must be a mapping")
+    result: Dict[str, int] = {}
+    for key, val in value.items():
+        label = str(key)
+        count = _coerce_optional_int(val)
+        if count is None:
+            raise TypeError("precision_mix counts must be integers")
+        result[label] = count
+    return result
+
+
+def _sanitize_int_sequence(value: Any, *, field: str) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"{field} must be a sequence, not a string")
+    if not isinstance(value, Sequence):
+        raise TypeError(f"{field} must be a sequence")
+    result: List[int] = []
+    for item in value:
+        coerced = _coerce_optional_int(item)
+        if coerced is None:
+            raise TypeError(f"{field} entries must be integers")
+        result.append(coerced)
+    return result
+
+
+def _sanitize_module_sequence(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        raise TypeError("ckpt_modules must be a sequence, not a string")
+    if not isinstance(value, Sequence):
+        raise TypeError("ckpt_modules must be a sequence")
+    return [str(item) for item in value]
+
+
+def _sanitize_break_reasons(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, Sequence):
+        raise TypeError("top_break_reasons must be a sequence")
+    result: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise TypeError("top_break_reasons entries must be mappings")
+        reason = str(item.get("reason", ""))
+        count = _coerce_optional_int(item.get("count"))
+        if count is None:
+            raise TypeError("top_break_reasons counts must be integers")
+        result.append({"reason": reason, "count": count})
+    return result
+
+
+def validate_telemetry_record(record: Mapping[str, Any]) -> Dict[str, Any]:
+    data = dict(record)
+    unknown = set(data) - set(TELEMETRY_SCHEMA)
+    if unknown:
+        raise ValueError(f"Unknown telemetry fields: {sorted(unknown)}")
+
+    sanitized: Dict[str, Any] = {}
+    for key, spec in TELEMETRY_SCHEMA.items():
+        value = data.get(key)
+        types = spec["types"]
+        required = bool(spec.get("required", False))
+
+        if value is None:
+            if type(None) not in types:
+                if required:
+                    raise ValueError(f"Missing required telemetry field: {key}")
+                sanitized[key] = None
+                continue
+            sanitized[key] = None
+            continue
+
+        if bool in types and isinstance(value, bool):
+            sanitized[key] = bool(value)
+            continue
+
+        if int in types and _is_int_like(value):
+            sanitized[key] = int(value)
+            continue
+
+        if float in types and _is_float_like(value):
+            sanitized[key] = float(value)
+            continue
+
+        if str in types and isinstance(value, str):
+            sanitized[key] = value
+            continue
+
+        if Mapping in types and isinstance(value, Mapping):
+            sanitized[key] = _sanitize_precision_mix(value)
+            continue
+
+        if Sequence in types:
+            if key == "ckpt_ids":
+                sanitized[key] = _sanitize_int_sequence(value, field="ckpt_ids")
+            elif key == "ckpt_modules":
+                sanitized[key] = _sanitize_module_sequence(value)
+            elif key == "top_break_reasons":
+                sanitized[key] = _sanitize_break_reasons(value)
+            else:
+                raise TypeError(f"Unsupported sequence field: {key}")
+            continue
+
+        if required:
+            raise TypeError(f"Invalid type for telemetry field {key}: {type(value)!r}")
+        sanitized[key] = None
+
+    return sanitized
+
+
+def allocator_memory_snapshot(device: Optional[int | torch.device] = None) -> Dict[str, Optional[Any]]:
+    stats = {
+        "allocated": None,
+        "reserved": None,
+        "active": None,
+        "fragmentation_hint": None,
+    }
+
+    if not torch.cuda.is_available():
+        return stats
+
+    try:
+        dev = torch.device(device) if device is not None else torch.cuda.current_device()
+    except Exception:
+        dev = torch.cuda.current_device()
+
+    try:
+        allocated = torch.cuda.memory.memory_allocated(dev)
+    except Exception:
+        allocated = None
+        legacy_alloc = getattr(torch.cuda, "memory_allocated", None)
+        if callable(legacy_alloc):
+            try:
+                allocated = legacy_alloc(dev)
+            except Exception:
+                allocated = None
+    if allocated is not None:
+        stats["allocated"] = _coerce_optional_int(allocated)
+
+    try:
+        reserved = torch.cuda.memory.memory_reserved(dev)
+    except Exception:
+        reserved = None
+        legacy_reserved = getattr(torch.cuda, "memory_reserved", None)
+        if callable(legacy_reserved):
+            try:
+                reserved = legacy_reserved(dev)
+            except Exception:
+                reserved = None
+    if reserved is not None:
+        stats["reserved"] = _coerce_optional_int(reserved)
+
+    memory_stats: Optional[Mapping[str, Any]] = None
+    stats_fn = getattr(torch.cuda.memory, "memory_stats", None)
+    if callable(stats_fn):
+        try:
+            memory_stats = stats_fn(dev)
+        except Exception:
+            memory_stats = None
+
+    inactive_split = None
+    if isinstance(memory_stats, Mapping):
+        active_key = "active_bytes.all.current"
+        active_val = memory_stats.get(active_key)
+        if active_val is not None:
+            stats["active"] = _coerce_optional_int(active_val)
+        inactive_split = _coerce_optional_int(memory_stats.get("inactive_split_bytes.all.current"))
+        reserved_val = _coerce_optional_int(memory_stats.get("reserved_bytes.all.current"))
+        if stats["reserved"] is None and reserved_val is not None:
+            stats["reserved"] = reserved_val
+        if stats["active"] is None:
+            active_calc = None
+            if reserved_val is not None and inactive_split is not None:
+                active_calc = max(reserved_val - inactive_split, 0)
+            elif stats["reserved"] is not None and inactive_split is not None:
+                active_calc = max(stats["reserved"] - inactive_split, 0)
+            if active_calc is not None:
+                stats["active"] = active_calc
+    if stats["fragmentation_hint"] is None:
+        reserve = stats["reserved"]
+        if reserve and reserve > 0 and inactive_split is not None:
+            stats["fragmentation_hint"] = max(min(inactive_split / reserve, 1.0), 0.0)
+
+    return stats
+
+
 class JsonlLogger:
     """Buffered JSONL writer.
 
@@ -529,7 +771,11 @@ class JsonlLogger:
         if not isinstance(record, Mapping):
             return
         try:
-            line = self._encode(record)
+            sanitized = validate_telemetry_record(record)
+        except Exception:
+            return
+        try:
+            line = self._encode(sanitized)
         except Exception:
             return
         self._buffer.append(line)
@@ -835,7 +1081,10 @@ __all__ = [
     "max_memory_allocated",
     "mem_get_info",
     "headroom_frac",
+    "allocator_memory_snapshot",
     "JsonlLogger",
+    "TELEMETRY_SCHEMA",
+    "validate_telemetry_record",
     "dist_is_initialized",
     "dist_get_rank",
     "dist_world_size",

@@ -33,6 +33,7 @@ from .runtime import (
     headroom_frac,
     grad_scaler_get_scale,
     JsonlLogger,
+    allocator_memory_snapshot,
     te_prepare_fp8_modules,
     te_fp8_autocast,
     dist_is_initialized,
@@ -873,13 +874,14 @@ class DPCS:
         # 1) Read memory headroom
         hr = self._read_headroom()
         hr = self._sync_min_headroom(hr)
-        free_b: Optional[int] = None
-        total_b: Optional[int] = None
+        device_free: Optional[int] = None
+        device_total: Optional[int] = None
         info = mem_get_info()
 
         if info is not None:
-            free_b, total_b = info
+            device_free, device_total = info
         peak_b = max_memory_allocated()
+        alloc_snapshot = allocator_memory_snapshot()
 
         # 2) Detect AMP overflow via GradScaler signals
         overflow = False
@@ -967,7 +969,7 @@ class DPCS:
                     w.use_ckpt = False
             elif self._ckpt_on:
                 act = [w.activation_bytes_ema for w in self._leaves]
-                enable_ids = self._ckpt_pol.plan(act, hr, free_b, peak_b)
+                enable_ids = self._ckpt_pol.plan(act, hr, device_free, peak_b)
                 self._ckpt_selected = set(enable_ids)
                 for i, w in enumerate(self._leaves):
                     w.use_ckpt = (i in self._ckpt_selected)
@@ -990,13 +992,17 @@ class DPCS:
                 "overflow": bool(overflow),
                 "overflow_flag": bool(overflow),
                 "cooldown_remaining": int(getattr(self._prec_pol, "cooldown", 0)),
-                "num_checkpointed": num_ckpt,
-                "ckpt_on": num_ckpt,
+                "num_checkpointed": int(num_ckpt),
+                "ckpt_on": bool(self._ckpt_on),
                 "num_leaves": int(len(self._leaves)),
                 "step_peak_bytes": int(peak_b),
                 "peak_alloc_bytes": int(peak_b),
-                "free_bytes": int(free_b) if free_b is not None else 0,
-                "total_bytes": int(total_b) if total_b is not None else 0,
+                "allocated": alloc_snapshot.get("allocated"),
+                "reserved": alloc_snapshot.get("reserved"),
+                "active": alloc_snapshot.get("active"),
+                "fragmentation_hint": alloc_snapshot.get("fragmentation_hint"),
+                "device_free": int(device_free) if device_free is not None else None,
+                "device_total": int(device_total) if device_total is not None else None,
                 "precision_mix": precision_hist,
                 "grad_var_avg": float(gvar) if gvar is not None else None,
                 "curv_avg": float(curv_avg) if curv_avg is not None else None,
