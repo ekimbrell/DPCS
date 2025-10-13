@@ -24,12 +24,14 @@ All helpers gracefully degrade on older PyTorch versions.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping as _MappingABC, Sequence as _SequenceABC
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 import json
 import math
 import os
 import time
+import numbers
 
 import torch
 import torch.nn as nn
@@ -485,6 +487,241 @@ def headroom_frac():
 # Logging helper -------------------------------------------------------------
 
 
+def _coerce_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    raise TypeError("expected an integer value")
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, numbers.Integral):
+        return bool(value)
+    raise TypeError("expected a boolean value")
+
+
+def _coerce_float(value: Any) -> float:
+    if isinstance(value, numbers.Real):
+        return float(value)
+    raise TypeError("expected a real value")
+
+
+def _coerce_precision_mix(value: Any) -> Dict[str, int]:
+    if not isinstance(value, _MappingABC):
+        raise TypeError("precision_mix must be a mapping")
+    result: Dict[str, int] = {}
+    for key, count in value.items():
+        result[str(key)] = _coerce_int(count)
+    return result
+
+
+def _coerce_sequence(value: Any, *, item_coerce: Callable[[Any], Any]) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("sequence value must not be a string")
+    if not isinstance(value, _SequenceABC):
+        raise TypeError("expected a sequence value")
+    return [item_coerce(item) for item in value]
+
+
+def _coerce_break_reasons(value: Any) -> List[Dict[str, Any]]:
+    reasons = _coerce_sequence(value, item_coerce=lambda x: x)
+    normalized: List[Dict[str, Any]] = []
+    for item in reasons:
+        if isinstance(item, _MappingABC):
+            reason = str(item.get("reason", ""))
+            count = _coerce_int(item.get("count", 0))
+        elif isinstance(item, (str, bytes, bytearray)):
+            reason = str(item)
+            count = 0
+        elif isinstance(item, _SequenceABC):
+            seq = list(item)
+            reason = str(seq[0]) if seq else ""
+            count = _coerce_int(seq[1]) if len(seq) > 1 else 0
+        else:
+            reason = str(item)
+            count = 0
+        normalized.append({"reason": reason, "count": count})
+    return normalized
+
+
+SchemaEntry = Dict[str, Any]
+
+
+TELEMETRY_SCHEMA: Dict[str, SchemaEntry] = {
+    "step": {"required": True, "coerce": _coerce_int},
+    "broadcast_step": {"required": True, "coerce": _coerce_int},
+    "headroom_frac": {"required": True, "coerce": _coerce_float, "allow_none": True},
+    "amp_mode": {"required": True, "coerce": str},
+    "overflow": {"required": True, "coerce": _coerce_bool},
+    "overflow_flag": {"required": True, "coerce": _coerce_bool},
+    "cooldown_remaining": {"required": True, "coerce": _coerce_int},
+    "num_checkpointed": {"required": True, "coerce": _coerce_int},
+    "ckpt_on": {"required": True, "coerce": _coerce_bool},
+    "num_leaves": {"required": True, "coerce": _coerce_int},
+    "step_peak_bytes": {"required": True, "coerce": _coerce_int},
+    "peak_alloc_bytes": {"required": True, "coerce": _coerce_int},
+    "allocated": {"required": True, "coerce": _coerce_int},
+    "reserved": {"required": True, "coerce": _coerce_int},
+    "active": {"required": True, "coerce": _coerce_int},
+    "fragmentation_hint": {"required": True, "coerce": _coerce_float},
+    "device_free": {
+        "required": True,
+        "coerce": _coerce_int,
+        "allow_none": True,
+    },
+    "device_total": {
+        "required": True,
+        "coerce": _coerce_int,
+        "allow_none": True,
+    },
+    "precision_mix": {"required": True, "coerce": _coerce_precision_mix},
+    "free_bytes": {"required": False, "coerce": _coerce_int},
+    "total_bytes": {"required": False, "coerce": _coerce_int},
+    "grad_var_avg": {"required": False, "coerce": _coerce_float, "allow_none": True},
+    "curv_avg": {"required": False, "coerce": _coerce_float, "allow_none": True},
+    "ckpt_ids": {
+        "required": False,
+        "coerce": lambda value: _coerce_sequence(value, item_coerce=_coerce_int),
+    },
+    "ckpt_modules": {
+        "required": False,
+        "coerce": lambda value: _coerce_sequence(value, item_coerce=str),
+    },
+    "graph_breaks_total": {"required": False, "coerce": _coerce_int},
+    "top_break_reasons": {
+        "required": False,
+        "coerce": _coerce_break_reasons,
+    },
+}
+
+
+def _sanitize_record(record: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(record, _MappingABC):
+        raise TypeError("record must be a mapping")
+    sanitized: Dict[str, Any] = {}
+    missing = [key for key, spec in TELEMETRY_SCHEMA.items() if spec.get("required") and key not in record]
+    if missing:
+        raise ValueError(f"missing telemetry fields: {', '.join(sorted(missing))}")
+    unknown = set(record.keys()) - set(TELEMETRY_SCHEMA.keys())
+    if unknown:
+        raise ValueError(f"unknown telemetry fields: {', '.join(sorted(unknown))}")
+    for key, value in record.items():
+        spec = TELEMETRY_SCHEMA.get(key)
+        if spec is None:
+            raise ValueError(f"unknown telemetry field: {key}")
+        if value is None:
+            if spec.get("allow_none"):
+                sanitized[key] = None
+                continue
+            raise TypeError(f"telemetry field '{key}' does not allow None")
+        coerce = spec.get("coerce")
+        if coerce is not None:
+            try:
+                coerced = coerce(value)
+            except Exception as exc:
+                raise TypeError(f"invalid value for telemetry field '{key}': {value!r}") from exc
+        else:
+            coerced = value
+        sanitized[key] = coerced
+    return sanitized
+
+
+def allocator_telemetry(device: Optional[int | torch.device] = None) -> Dict[str, Any]:
+    stats = {
+        "allocated": 0,
+        "reserved": 0,
+        "active": 0,
+        "fragmentation_hint": 0.0,
+    }
+    if not torch.cuda.is_available():
+        return stats
+    if device is None:
+        try:
+            index = torch.cuda.current_device()
+        except Exception:
+            index = 0
+        candidate: Any = f"cuda:{index}"
+    else:
+        candidate = device
+    try:
+        dev = torch.device(candidate)
+    except Exception:
+        if device is not None:
+            return stats
+        try:
+            dev = torch.device("cuda:0")
+        except Exception:
+            return stats
+
+    def _call(name: str, fallback: Optional[str] = None) -> int:
+        target = getattr(torch.cuda, "memory", torch.cuda)
+        fn = getattr(target, name, None)
+        if fn is None and fallback is not None:
+            fn = getattr(torch.cuda, fallback, None)
+        if fn is None:
+            return 0
+        try:
+            value = fn(dev)
+        except TypeError:
+            try:
+                value = fn()
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(value.item())  # type: ignore[union-attr]
+            except Exception:
+                return 0
+
+    allocated = _call("memory_allocated", "memory_allocated")
+    reserved = _call("memory_reserved", "memory_reserved")
+
+    stats["allocated"] = allocated
+    stats["reserved"] = reserved
+
+    try:
+        raw_stats = torch.cuda.memory_stats(dev)
+    except TypeError:
+        try:
+            raw_stats = torch.cuda.memory_stats()
+        except Exception:
+            raw_stats = None
+    except Exception:
+        raw_stats = None
+
+    if isinstance(raw_stats, _MappingABC):
+        try:
+            stats["active"] = int(raw_stats.get("active_bytes.all.current", allocated))
+        except Exception:
+            stats["active"] = allocated
+        frag = raw_stats.get("fragmentation", raw_stats.get("fragmentation_metric"))
+        if frag is None:
+            try:
+                inactive = int(raw_stats.get("inactive_split_bytes.all.current", 0))
+                total = reserved if reserved > 0 else int(raw_stats.get("reserved_bytes.all.current", reserved))
+                frag = (inactive / total) if total else 0.0
+            except Exception:
+                frag = 0.0
+        try:
+            stats["fragmentation_hint"] = float(frag)
+        except Exception:
+            stats["fragmentation_hint"] = 0.0
+    else:
+        stats["active"] = allocated
+        stats["fragmentation_hint"] = 0.0
+
+    return stats
+
+
 class JsonlLogger:
     """Buffered JSONL writer.
 
@@ -526,10 +763,9 @@ class JsonlLogger:
     def log(self, record: Mapping[str, Any]) -> None:
         if self._closed:
             return
-        if not isinstance(record, Mapping):
-            return
+        data = _sanitize_record(record)
         try:
-            line = self._encode(record)
+            line = self._encode(data)
         except Exception:
             return
         self._buffer.append(line)
@@ -835,6 +1071,8 @@ __all__ = [
     "max_memory_allocated",
     "mem_get_info",
     "headroom_frac",
+    "allocator_telemetry",
+    "TELEMETRY_SCHEMA",
     "JsonlLogger",
     "dist_is_initialized",
     "dist_get_rank",

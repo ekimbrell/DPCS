@@ -31,6 +31,7 @@ from .runtime import (
     max_memory_allocated,
     mem_get_info,
     headroom_frac,
+    allocator_telemetry,
     grad_scaler_get_scale,
     JsonlLogger,
     te_prepare_fp8_modules,
@@ -880,6 +881,7 @@ class DPCS:
         if info is not None:
             free_b, total_b = info
         peak_b = max_memory_allocated()
+        alloc_stats = allocator_telemetry()
 
         # 2) Detect AMP overflow via GradScaler signals
         overflow = False
@@ -982,6 +984,9 @@ class DPCS:
         if self._jsonl_logger and (self._step % self._log_every == 0):
             num_ckpt = int(sum(1 for w in self._leaves if w.use_ckpt))
             precision_hist = self.precision_mix()
+            device_free_val = int(free_b) if free_b is not None else None
+            device_total_val = int(total_b) if total_b is not None else None
+
             rec = {
                 "step": int(self._step),
                 "broadcast_step": int(self._broadcast_counter),
@@ -991,16 +996,24 @@ class DPCS:
                 "overflow_flag": bool(overflow),
                 "cooldown_remaining": int(getattr(self._prec_pol, "cooldown", 0)),
                 "num_checkpointed": num_ckpt,
-                "ckpt_on": num_ckpt,
+                "ckpt_on": bool(num_ckpt),
                 "num_leaves": int(len(self._leaves)),
                 "step_peak_bytes": int(peak_b),
                 "peak_alloc_bytes": int(peak_b),
-                "free_bytes": int(free_b) if free_b is not None else 0,
-                "total_bytes": int(total_b) if total_b is not None else 0,
+                "allocated": int(alloc_stats.get("allocated", 0)),
+                "reserved": int(alloc_stats.get("reserved", 0)),
+                "active": int(alloc_stats.get("active", alloc_stats.get("allocated", 0))),
+                "fragmentation_hint": float(alloc_stats.get("fragmentation_hint", 0.0)),
+                "device_free": device_free_val,
+                "device_total": device_total_val,
                 "precision_mix": precision_hist,
                 "grad_var_avg": float(gvar) if gvar is not None else None,
                 "curv_avg": float(curv_avg) if curv_avg is not None else None,
             }
+            if device_free_val is not None:
+                rec["free_bytes"] = device_free_val
+            if device_total_val is not None:
+                rec["total_bytes"] = device_total_val
             if self._ckpt_selected:
                 ids = sorted(int(i) for i in self._ckpt_selected)
             else:
