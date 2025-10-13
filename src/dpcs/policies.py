@@ -78,6 +78,15 @@ class PrecisionPolicy:
     mode (bf16 when available, otherwise fp16). Any overflow observation triggers
     an immediate promotion back to fp32 with a short cooldown window to reassess
     stability. FP8 decisions are gated by the runtime via :meth:`update_fp8_support`.
+
+    State diagram::
+
+        fp32 --(stable ≥ patience)--> low_mode
+        low_mode --(overflow)--> fp32 [cooldown]
+        fp32 --(cooldown > 0)--> fp32
+
+    The cooldown ensures a run of fp32 steps before demotion resumes, preventing
+    mode flip-flops when overflows occur in close succession.
     """
 
     def __init__(self, cfg: PrecisionCfg, bf16_supported: bool, amp_available: bool = True) -> None:
