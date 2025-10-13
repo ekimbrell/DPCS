@@ -357,6 +357,7 @@ class DPCS:
         self._log_path: Optional[str] = None
         self._log_every = max(1, int(self.cfg.log_every))
         self._jsonl_logger: Optional[JsonlLogger] = None
+        self._broadcast_counter: int = 0
 
         self._update_autocast()
 
@@ -662,21 +663,26 @@ class DPCS:
         rank = dist_get_rank(default=0)
         base = self._precision_to_bits(self._amp_mode) & 0b11
 
-        with torch.no_grad():
-            if rank == 0:
-                tensor.fill_(base)
-                if self._module_slots:
-                    for leaf_idx, slot in enumerate(self._module_slots):
-                        value = base
-                        if leaf_idx < len(self._leaves) and self._leaves[leaf_idx].use_ckpt:
-                            value |= 0b100
-                        tensor[slot] = value
-                else:
-                    tensor[0] = base
-            else:
-                tensor.zero_()
+        refresh = (self._step % self._ddp_tick_every) == 0 or self._broadcast_counter == 0
 
-        if not dist_broadcast(tensor, src=0):
+        with torch.no_grad():
+            if refresh:
+                if rank == 0:
+                    tensor.fill_(base)
+                    if self._module_slots:
+                        for leaf_idx, slot in enumerate(self._module_slots):
+                            value = base
+                            if leaf_idx < len(self._leaves) and self._leaves[leaf_idx].use_ckpt:
+                                value |= 0b100
+                            tensor[slot] = value
+                    else:
+                        tensor[0] = base
+                else:
+                    tensor.zero_()
+
+        if dist_broadcast(tensor):
+            self._broadcast_counter += 1
+        else:
             return
 
         self._apply_decision_tensor(tensor)
@@ -877,8 +883,7 @@ class DPCS:
                 for w in self._leaves:
                     w.use_ckpt = False
 
-        if (self._step % self._ddp_tick_every) == 0:
-            self._broadcast_decisions()
+        self._broadcast_decisions()
 
         # 5) Logging (optional)
         if self._jsonl_logger and (self._step % self._log_every == 0):
@@ -886,6 +891,7 @@ class DPCS:
             precision_hist = self.precision_mix()
             rec = {
                 "step": int(self._step),
+                "broadcast_step": int(self._broadcast_counter),
                 "headroom_frac": float(hr) if hr is not None else None,
                 "amp_mode": self._amp_mode,
                 "overflow": bool(overflow),
