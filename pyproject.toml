@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Your Name", email = "you@example.com" }]
-dependencies = ["torch>=2.5"]
+dependencies = [
+    "numpy>=2.0.2",
+    "torch>=2.5",
+]
 
 # Optional bits: install with `pip install dpcs[fp8]` or `dpcs[signals]`
 [project.optional-dependencies]
@@ -26,3 +29,8 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
