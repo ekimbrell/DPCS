@@ -67,6 +67,8 @@ class DPCSConfig:
     ckpt_topk_frac: float = 0.20       # fraction of heaviest leaves to ckpt
     ckpt_use_benefit_score: int = 1    # 1: bytes / fwd_ms_ema ranking; 0: bytes
     min_activation_bytes_to_ckpt: int = 1 << 20  # ignore tiny activations (<1 MiB)
+    delegate_selective_ckpt: bool = False  # delegate to PyTorch selective ckpt
+    activation_memory_budget_frac: float | None = None  # budget when delegating
 
     # --------------------- TransformerEngine FP8 (opt) --------------------
     te_amax_history_len: int = 16
@@ -141,8 +143,9 @@ class DPCSConfig:
         _frac("low_headroom_frac")
         _frac("hi_headroom_frac")
         _frac("ckpt_topk_frac")
+        _frac("activation_memory_budget_frac")
 
-        for name in ("compile_diagnostics", "no_flip_during_warmup"):
+        for name in ("compile_diagnostics", "no_flip_during_warmup", "delegate_selective_ckpt"):
             if name in init:
                 init[name] = bool(init[name])
 

@@ -17,6 +17,7 @@ Exposed functions (stable):
 - mem_get_info() -> Optional[Tuple[int, int]]
 - headroom_frac() -> Optional[float]
 - checkpoint_call(fn: Callable, *args, determinism_check: str = "none", **kwargs) -> Any
+- with_activation_budget(budget_frac: Optional[float]) -> ContextManager
 
 All helpers gracefully degrade on older PyTorch versions.
 """
@@ -24,8 +25,9 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 import json
+import math
 import os
 import time
 
@@ -561,6 +563,55 @@ class JsonlLogger:
 
 # Checkpoint helper -----------------------------------------------------------
 
+@contextmanager
+def with_activation_budget(budget_frac: Optional[float]) -> Iterator[None]:
+    """Temporarily enable PyTorch selective checkpointing activation budgets."""
+
+    if budget_frac is None:
+        yield
+        return
+
+    try:
+        budget = float(budget_frac)
+    except Exception:
+        budget = 0.0
+    if not math.isfinite(budget):
+        budget = 0.0
+    budget = max(0.0, min(1.0, budget))
+
+    targets: List[Tuple[Any, str, Any]] = []
+
+    def _prepare_target(obj: Any, attr: str) -> None:
+        if obj is None or not hasattr(obj, attr):
+            return
+        try:
+            prev = getattr(obj, attr)
+        except Exception:
+            prev = None
+        try:
+            setattr(obj, attr, budget)
+        except Exception:
+            return
+        targets.append((obj, attr, prev))
+
+    functorch_cfg = getattr(getattr(torch, "_functorch", None), "config", None)
+    torch_cfg = getattr(torch, "config", None)
+    for cfg in (functorch_cfg, torch_cfg):
+        for name in (
+            "activation_memory_budget",
+            "selective_checkpointing_activation_memory_budget",
+        ):
+            _prepare_target(cfg, name)
+
+    try:
+        yield
+    finally:
+        for obj, attr, prev in reversed(targets):
+            try:
+                setattr(obj, attr, prev)
+            except Exception:
+                pass
+
 def checkpoint_call(fn, *args, determinism_check: str = "none", **kwargs):
     """Call ``torch.utils.checkpoint.checkpoint`` with modern defaults.
 
@@ -790,6 +841,7 @@ __all__ = [
     "dist_world_size",
     "dist_broadcast",
     "checkpoint_call",
+    "with_activation_budget",
     "timed_cuda",
 ]
 

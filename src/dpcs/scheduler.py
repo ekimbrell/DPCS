@@ -12,6 +12,7 @@ It keeps the Python hot path small and avoids per-step dynamic allocations.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import math
 import os
@@ -37,6 +38,7 @@ from .runtime import (
     dist_is_initialized,
     dist_get_rank,
     dist_broadcast,
+    with_activation_budget,
 )
 
 def count_graph_breaks(step_fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -367,7 +369,9 @@ class DPCS:
         self._leaves: List[_CkptWrap] = []
         self._grads: Optional[GradSignals] = None
         self._curv: Optional[CurvatureSignals] = None
-        self._ckpt_on: bool = True
+        self._delegate_ckpt: bool = bool(self.cfg.delegate_selective_ckpt)
+        self._activation_budget_frac: Optional[float] = self.cfg.activation_memory_budget_frac
+        self._ckpt_on: bool = not self._delegate_ckpt
         self._ckpt_selected: set[int] = set()
 
         # Policies
@@ -770,7 +774,18 @@ class DPCS:
             raise TypeError("vram_headroom override must be callable or None")
 
     def enable_checkpointing(self, enabled: bool) -> None:
-        self._ckpt_on = bool(enabled)
+        if self._delegate_ckpt and enabled:
+            raise RuntimeError(
+                "delegate_selective_ckpt is enabled; per-leaf checkpoint planning is disabled"
+            )
+        self._ckpt_on = bool(enabled and not self._delegate_ckpt)
+
+    def forward_context(self):
+        """Context manager applied around forward passes."""
+
+        if self._delegate_ckpt:
+            return with_activation_budget(self._activation_budget_frac)
+        return nullcontext()
 
     def overflow_monitor(self, scaler: torch.amp.GradScaler) -> AmpOverflowMonitor:
         if scaler is None:
@@ -940,7 +955,11 @@ class DPCS:
 
         # 4) Checkpoint policy
         if self._leaves:
-            if warmup_active and self._ckpt_selected:
+            if self._delegate_ckpt:
+                self._ckpt_selected.clear()
+                for w in self._leaves:
+                    w.use_ckpt = False
+            elif warmup_active and self._ckpt_selected:
                 for i, w in enumerate(self._leaves):
                     w.use_ckpt = (i in self._ckpt_selected)
             elif warmup_active:
