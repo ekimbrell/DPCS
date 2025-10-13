@@ -889,6 +889,8 @@ class DPCS:
                 "headroom_frac": float(hr) if hr is not None else None,
                 "amp_mode": self._amp_mode,
                 "overflow": bool(overflow),
+                "overflow_flag": bool(overflow),
+                "cooldown_remaining": int(getattr(self._prec_pol, "cooldown", 0)),
                 "num_checkpointed": num_ckpt,
                 "ckpt_on": num_ckpt,
                 "num_leaves": int(len(self._leaves)),
