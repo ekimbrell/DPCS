@@ -77,6 +77,11 @@ class DPCSConfig:
     # ----------------------------- Logging --------------------------------
     log_every: int = 1  # emit JSONL every step by default
 
+    # ------------------------- Compile diagnostics ------------------------
+    compile_diagnostics: bool = False
+    compile_warmup_steps: int = 20
+    no_flip_during_warmup: bool = True
+
     # ----------------------------- Helpers --------------------------------
     def amp_dtype(self) -> torch.dtype:
         """Return the autocast dtype preference for this device.
@@ -131,10 +136,15 @@ class DPCSConfig:
         _nz_int("te_margin_inc")
         _nz_int("te_margin_dec")
         _nz_int("log_every")
+        _nz_int("compile_warmup_steps")
 
         _frac("low_headroom_frac")
         _frac("hi_headroom_frac")
         _frac("ckpt_topk_frac")
+
+        for name in ("compile_diagnostics", "no_flip_during_warmup"):
+            if name in init:
+                init[name] = bool(init[name])
 
         # Ensure bands are ordered (low <= high)
         if "epsilon_g_low" in init and "epsilon_g_high" in init:

@@ -11,6 +11,7 @@ It keeps the Python hot path small and avoids per-step dynamic allocations.
 """
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import math
 import os
@@ -37,6 +38,38 @@ from .runtime import (
     dist_get_rank,
     dist_broadcast,
 )
+
+def count_graph_breaks(step_fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Return graph break statistics for a compiled step function."""
+
+    dynamo = getattr(torch, "_dynamo", None)
+    explain = getattr(dynamo, "explain", None) if dynamo is not None else None
+    if not callable(explain):
+        return {"graph_breaks_total": 0, "top_break_reasons": []}
+
+    try:
+        result = explain(step_fn)(*args, **kwargs)
+    except Exception:
+        return {"graph_breaks_total": 0, "top_break_reasons": []}
+
+    total = 0
+    try:
+        total = int(getattr(result, "graph_break_count", 0))
+    except Exception:
+        total = 0
+
+    counts: Counter[str] = Counter()
+    reasons = getattr(result, "break_reasons", None)
+    if isinstance(reasons, Iterable):
+        for item in reasons:
+            label = getattr(item, "reason", None)
+            if label is None:
+                label = str(item)
+            counts[str(label)] += 1
+
+    top = [{"reason": reason, "count": int(count)} for reason, count in counts.most_common(5)]
+    return {"graph_breaks_total": int(total), "top_break_reasons": top}
+
 
 # ------------------------ checkpointable leaf wrapper -----------------------
 
@@ -361,6 +394,18 @@ class DPCS:
 
         self._update_autocast()
 
+        self._compile_diagnostics = bool(getattr(self.cfg, "compile_diagnostics", False))
+        try:
+            warmup = int(getattr(self.cfg, "compile_warmup_steps", 0))
+        except Exception:
+            warmup = 0
+        self._compile_warmup_steps = max(0, warmup)
+        self._compile_no_flip = bool(getattr(self.cfg, "no_flip_during_warmup", True))
+        self._compile_step_fn: Optional[Callable[..., Any]] = None
+        self._compile_step_args: Tuple[Any, ...] = ()
+        self._compile_step_kwargs: Dict[str, Any] = {}
+        self._compile_last_breaks: Optional[Dict[str, Any]] = None
+
     # ------------------------------ API ------------------------------------
 
     def wrap(self, model: nn.Module) -> nn.Module:
@@ -449,6 +494,22 @@ class DPCS:
             except Exception:
                 pass
         self._jsonl_logger = JsonlLogger(path_str, flush_every=20)
+
+    def set_compile_step_fn(self, step_fn: Optional[Callable[..., Any]], *args: Any, **kwargs: Any) -> None:
+        """Register a callable used to profile graph breaks under ``torch.compile``."""
+
+        if step_fn is None:
+            self._compile_step_fn = None
+            self._compile_step_args = ()
+            self._compile_step_kwargs = {}
+            self._compile_last_breaks = None
+            return
+        if not callable(step_fn):
+            raise TypeError("step_fn must be callable or None")
+        self._compile_step_fn = step_fn
+        self._compile_step_args = tuple(args)
+        self._compile_step_kwargs = dict(kwargs)
+        self._compile_last_breaks = None
 
     def get_amp_config(self) -> Tuple[str, torch.dtype, bool]:
         device_type = self.cfg.device_type
@@ -852,6 +913,11 @@ class DPCS:
             if vals:
                 curv_avg = float(sum(vals) / len(vals))
         prev_mode = self._amp_mode
+        warmup_active = (
+            self._compile_diagnostics
+            and self._compile_no_flip
+            and self._step < self._compile_warmup_steps
+        )
         override_mode = self._manual_precision_mode
         if not self._precision_enabled:
             override_mode = override_mode or "fp32"
@@ -866,13 +932,21 @@ class DPCS:
                     new_mode = "fp16"
                 else:
                     new_mode = "fp32"
+            if warmup_active:
+                new_mode = prev_mode
         self._amp_mode = new_mode
         self._update_autocast()
         self._update_te_margin(prev_mode, new_mode, overflow)
 
         # 4) Checkpoint policy
         if self._leaves:
-            if self._ckpt_on:
+            if warmup_active and self._ckpt_selected:
+                for i, w in enumerate(self._leaves):
+                    w.use_ckpt = (i in self._ckpt_selected)
+            elif warmup_active:
+                for w in self._leaves:
+                    w.use_ckpt = False
+            elif self._ckpt_on:
                 act = [w.activation_bytes_ema for w in self._leaves]
                 enable_ids = self._ckpt_pol.plan(act, hr, free_b, peak_b)
                 self._ckpt_selected = set(enable_ids)
@@ -918,6 +992,16 @@ class DPCS:
                     self._leaf_names[i] if 0 <= i < len(self._leaf_names) else str(i)
                     for i in ids
                 ]
+            if self._compile_diagnostics and self._step >= self._compile_warmup_steps:
+                stats = {"graph_breaks_total": 0, "top_break_reasons": []}
+                if self._compile_step_fn is not None:
+                    stats = count_graph_breaks(
+                        self._compile_step_fn,
+                        *self._compile_step_args,
+                        **self._compile_step_kwargs,
+                    )
+                self._compile_last_breaks = stats
+                rec.update(stats)
             try:
                 self._jsonl_logger.log(rec)
             except Exception:
@@ -955,4 +1039,4 @@ class DPCS:
                 pass
 
 
-__all__ = ["DPCS", "AmpOverflowMonitor"]
+__all__ = ["DPCS", "AmpOverflowMonitor", "count_graph_breaks"]
