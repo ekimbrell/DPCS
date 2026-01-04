@@ -5,7 +5,7 @@ PyTorch dependencies in the hot path (pure Python & math), so the scheduler can
 call it without pulling extra overhead into the step loop.
 
 Exported API:
-  - PrecisionPolicy(cfg, bf16_supported: bool)
+  - PrecisionPolicy(cfg, signal_cfg: DPCSConfig, bf16_supported: bool)
       .decide(headroom: float | None,
               grad_var: float | None,
               curvature: float | None,
@@ -70,7 +70,7 @@ class PrecisionCfg:
 
 
 class PrecisionPolicy:
-    """Finite-state policy for AMP mode selection.
+    """Finite-state policy for AMP mode selection with signal-aware stability checks.
 
     Modes: "fp32", "bf16", "fp16", and optionally "fp8" when TransformerEngine
     replacements are available. The conservative policy starts in fp32, waits
@@ -85,12 +85,22 @@ class PrecisionPolicy:
         low_mode --(overflow)--> fp32 [cooldown]
         fp32 --(cooldown > 0)--> fp32
 
+    Gradient variance (EMA) and curvature bands (from :class:`DPCSConfig`) are
+    used as additional stability signals: high values delay demotion and can
+    force promotion, while low values accelerate the stable-step counter.
     The cooldown ensures a run of fp32 steps before demotion resumes, preventing
     mode flip-flops when overflows occur in close succession.
     """
 
-    def __init__(self, cfg: PrecisionCfg, bf16_supported: bool, amp_available: bool = True) -> None:
+    def __init__(
+        self,
+        cfg: PrecisionCfg,
+        signal_cfg: DPCSConfig,
+        bf16_supported: bool,
+        amp_available: bool = True,
+    ) -> None:
         self.cfg = cfg
+        self.signal_cfg = signal_cfg
         self.amp_available = bool(amp_available)
         self.bf16_supported = bool(bf16_supported)
         self.low_mode = "fp32"
@@ -109,6 +119,10 @@ class PrecisionPolicy:
         self._fp8_low_headroom = 0.05
         self._fp8_high_headroom = 0.10
         self._fp8_reentry_cooldown = 0
+        self._epsilon_g_low = float(self.signal_cfg.epsilon_g_low)
+        self._epsilon_g_high = float(self.signal_cfg.epsilon_g_high)
+        self._kappa_low = float(self.signal_cfg.kappa_low)
+        self._kappa_high = float(self.signal_cfg.kappa_high)
 
     def update_fp8_support(
         self,
@@ -139,10 +153,17 @@ class PrecisionPolicy:
         overflow: bool,
         current: str,
     ) -> str:
-        del grad_var, curvature  # unused in the conservative policy
-
         if self._fp8_reentry_cooldown > 0:
             self._fp8_reentry_cooldown -= 1
+
+        gvar = None if grad_var is None else float(grad_var)
+        curv = None if curvature is None else float(curvature)
+        grad_high = gvar is not None and gvar >= self._epsilon_g_high
+        grad_low = gvar is not None and gvar <= self._epsilon_g_low
+        curv_high = curv is not None and curv >= self._kappa_high
+        curv_low = curv is not None and curv <= self._kappa_low
+        signal_unstable = grad_high or curv_high
+        signal_stable = (gvar is None or grad_low) and (curv is None or curv_low)
 
         mode = str(current).lower()
         if mode not in {"fp32", "bf16", "fp16", "fp8"}:
@@ -160,6 +181,17 @@ class PrecisionPolicy:
         if not self.amp_available or self.low_mode == "fp32":
             self.cooldown = 0
             self._stable_steps = 0
+            return "fp32"
+
+        if signal_unstable and mode != "fp32":
+            self.cooldown = self._cooldown_window
+            self._stable_steps = 0
+            if self.low_mode == "bf16" and self.amp_available:
+                self._active_low_mode = "fp16"
+            if mode == "fp8":
+                self._fp8_reentry_cooldown = max(
+                    self._fp8_reentry_cooldown, self._cooldown_window
+                )
             return "fp32"
 
         fp8_supported = self._fp8_supported and self.amp_available
@@ -202,7 +234,13 @@ class PrecisionPolicy:
                 self.cooldown -= 1
                 self._stable_steps = 0
                 return "fp32"
-            self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+            if signal_unstable:
+                self._stable_steps = 0
+                return "fp32"
+            if signal_stable:
+                self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+            else:
+                self._stable_steps = 0
             if self._stable_steps >= self.cfg.patience:
                 if self.low_mode == "bf16":
                     return self._active_low_mode
@@ -211,7 +249,10 @@ class PrecisionPolicy:
 
         # Already running in low precision. Stay there unless a new overflow occurs.
         self.cooldown = 0
-        self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+        if signal_stable:
+            self._stable_steps = min(self._stable_steps + 1, self.cfg.patience)
+        else:
+            self._stable_steps = 0
         if self.low_mode == "bf16":
             return self._active_low_mode
         return self.low_mode
