@@ -24,6 +24,23 @@ with, and call at predictable places in your loop (`start_step → forward/backw
 → collect_signals → optimizer.step → end_step`). Each call updates an internal
 state machine that enforces hysteresis so precision modes do not thrash.
 
+## Objective
+DPCS aims to keep training stable while maximizing throughput under available
+memory headroom. It does that by promoting precision only when signals indicate
+numerical risk, and by adding checkpointing only when allocator pressure is
+meaningful enough to warrant the extra recompute.
+
+## Signals and precision transitions (high level)
+* **Gradient variance** acts as a stability proxy: low, steady variance allows
+  safe demotion into bf16/fp16/fp8, while spikes push the policy to stay in or
+  return to fp32.
+* **Curvature estimates** (top Hessian eigenvalue probes) capture sensitivity;
+  higher curvature tightens the precision budget and can trigger promotions even
+  if variance is otherwise stable.
+* **Memory headroom** gates aggressive modes: if headroom is tight, the policy
+  avoids precision promotion and leans on checkpointing/FP8 only when there is
+  room for the extra metadata and scaling overhead.
+
 ## How the scheduler works
 1. **Model wrapping.** `DPCS.wrap(model)` recursively replaces every leaf module
    (linears and convolutions by default, plus any module with no children) with
@@ -41,10 +58,11 @@ state machine that enforces hysteresis so precision modes do not thrash.
    machine that prefers bf16 when available, falls back to fp16 otherwise, and
    escalates back to fp32 on overflow. When FP8 is available it uses the same
    headroom gates as activation checkpointing. The checkpoint policy ranks leaves
-   by activation-byte EMAs and enables the top fraction allowed by both global
-   and per-step pressure limits. Gradient variance EMAs, optional curvature
-   power iterations, and allocator introspection feed those policies without
-   allocating new tensors on the hot path.
+   by activation-byte EMAs (bytes saved) and a benefit score (bytes saved per
+   recompute cost), then enables the best candidates within global and per-step
+   pressure limits. Gradient variance EMAs, optional curvature power iterations,
+   and allocator introspection feed those policies without allocating new tensors
+   on the hot path.
 4. **Distributed coordination.** If `torch.distributed` is initialized, DPCS
    encodes the chosen AMP mode and checkpoint mask into a tiny tensor and
    broadcasts it from rank 0 so that every replica applies identical decisions.
