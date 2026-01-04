@@ -417,6 +417,7 @@ class DPCS:
         bf16_supported = self._amp_device_available and self._amp_preferred_dtype is torch.bfloat16
         self._prec_pol = PrecisionPolicy(
             self._prec_cfg,
+            signal_cfg=self.cfg,
             bf16_supported=bf16_supported,
             amp_available=self._amp_device_available,
         )

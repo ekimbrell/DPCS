@@ -9,13 +9,14 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from dpcs.config import DPCSConfig  # noqa: E402
 from dpcs.policies import PrecisionCfg, PrecisionPolicy  # noqa: E402
 
 
 @pytest.mark.parametrize("bf16_supported", [True, False])
 def test_policy_demotes_after_patience(bf16_supported: bool) -> None:
     cfg = PrecisionCfg(patience=3)
-    pol = PrecisionPolicy(cfg, bf16_supported=bf16_supported, amp_available=True)
+    pol = PrecisionPolicy(cfg, signal_cfg=DPCSConfig(), bf16_supported=bf16_supported, amp_available=True)
     mode = "fp32"
 
     for _ in range(cfg.patience - 1):
@@ -30,7 +31,7 @@ def test_policy_demotes_after_patience(bf16_supported: bool) -> None:
 
 def test_policy_overflow_forces_cooldown() -> None:
     cfg = PrecisionCfg(patience=6)
-    pol = PrecisionPolicy(cfg, bf16_supported=True, amp_available=True)
+    pol = PrecisionPolicy(cfg, signal_cfg=DPCSConfig(), bf16_supported=True, amp_available=True)
     mode = "fp32"
 
     for _ in range(cfg.patience):
@@ -57,7 +58,7 @@ def test_policy_overflow_forces_cooldown() -> None:
 
 def test_policy_prefers_bf16_with_hysteresis() -> None:
     cfg = PrecisionCfg(patience=2, bf16_entry_headroom=0.2, bf16_exit_headroom=0.1)
-    pol = PrecisionPolicy(cfg, bf16_supported=True, amp_available=True)
+    pol = PrecisionPolicy(cfg, signal_cfg=DPCSConfig(), bf16_supported=True, amp_available=True)
     mode = "fp32"
 
     mode = pol.decide(0.3, None, None, False, mode)
@@ -78,7 +79,7 @@ def test_policy_prefers_bf16_with_hysteresis() -> None:
 
 def test_policy_stays_fp32_when_amp_unavailable() -> None:
     cfg = PrecisionCfg(patience=2)
-    pol = PrecisionPolicy(cfg, bf16_supported=True, amp_available=False)
+    pol = PrecisionPolicy(cfg, signal_cfg=DPCSConfig(), bf16_supported=True, amp_available=False)
     mode = "fp32"
 
     for _ in range(5):
@@ -88,7 +89,7 @@ def test_policy_stays_fp32_when_amp_unavailable() -> None:
 
 def test_policy_respects_fp16_preference() -> None:
     cfg = PrecisionCfg(prefer_bf16=False, patience=3)
-    pol = PrecisionPolicy(cfg, bf16_supported=True, amp_available=True)
+    pol = PrecisionPolicy(cfg, signal_cfg=DPCSConfig(), bf16_supported=True, amp_available=True)
     mode = "fp32"
 
     for _ in range(cfg.patience):

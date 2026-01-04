@@ -21,6 +21,7 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from dpcs.config import DPCSConfig  # noqa: E402
 from dpcs.policies import PrecisionCfg, PrecisionPolicy  # noqa: E402
 from dpcs.runtime import AmpOverflowMonitor  # noqa: E402
 from dpcs.scheduler import DPCS  # noqa: E402
@@ -74,7 +75,12 @@ def _reach_low_mode(policy: PrecisionPolicy, mode: str, steps: int, *, headroom:
 
 def test_amp_policy_clean_steps_follow_state_diagram() -> None:
     cfg = PrecisionCfg(prefer_bf16=False, patience=3, cooldown_steps=2)
-    policy = PrecisionPolicy(cfg, bf16_supported=False, amp_available=True)
+    policy = PrecisionPolicy(
+        cfg,
+        signal_cfg=DPCSConfig(),
+        bf16_supported=False,
+        amp_available=True,
+    )
     mode = "fp32"
     states: List[str] = []
 
@@ -93,7 +99,12 @@ def test_amp_policy_clean_steps_follow_state_diagram() -> None:
 
 def test_amp_policy_single_overflow_triggers_cooldown() -> None:
     cfg = PrecisionCfg(prefer_bf16=False, patience=3, cooldown_steps=2)
-    policy = PrecisionPolicy(cfg, bf16_supported=False, amp_available=True)
+    policy = PrecisionPolicy(
+        cfg,
+        signal_cfg=DPCSConfig(),
+        bf16_supported=False,
+        amp_available=True,
+    )
     mode = _reach_low_mode(policy, "fp32", cfg.patience, headroom=0.7)
     assert mode == "fp16"
 
@@ -127,7 +138,12 @@ def test_amp_policy_single_overflow_triggers_cooldown() -> None:
 
 def test_amp_policy_repeated_overflow_resets_cooldown() -> None:
     cfg = PrecisionCfg(prefer_bf16=False, patience=2, cooldown_steps=3)
-    policy = PrecisionPolicy(cfg, bf16_supported=False, amp_available=True)
+    policy = PrecisionPolicy(
+        cfg,
+        signal_cfg=DPCSConfig(),
+        bf16_supported=False,
+        amp_available=True,
+    )
     mode = _reach_low_mode(policy, "fp32", cfg.patience, headroom=0.65)
     assert mode == "fp16"
 
@@ -172,7 +188,12 @@ def test_amp_policy_repeated_overflow_resets_cooldown() -> None:
 
 def test_amp_policy_nan_inf_counts_as_overflow() -> None:
     cfg = PrecisionCfg(prefer_bf16=False, patience=2, cooldown_steps=2)
-    policy = PrecisionPolicy(cfg, bf16_supported=False, amp_available=True)
+    policy = PrecisionPolicy(
+        cfg,
+        signal_cfg=DPCSConfig(),
+        bf16_supported=False,
+        amp_available=True,
+    )
     mode = _reach_low_mode(policy, "fp32", cfg.patience, headroom=0.8)
     assert mode == "fp16"
 
