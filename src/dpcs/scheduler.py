@@ -20,9 +20,9 @@ import os
 import torch
 import torch.nn as nn
 
-from .config import DPCSConfig, CheckpointCfg
+from .config import DPCSConfig, CheckpointCfg, TelemetryCfg
 from .policies import PrecisionPolicy, CheckpointPolicy, PrecisionCfg
-from .signals import GradSignals, CurvatureSignals, EMA, tensor_bytes
+from .signals import GradSignals, CurvatureSignals, EMA, ForwardTimer, tensor_bytes
 from .runtime import (
     AmpOverflowMonitor,
     amp_preferred_dtype,
@@ -89,7 +89,13 @@ def _call_with_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Callabl
 class _CkptWrap(nn.Module):
     """Wrap a leaf to optionally run under activation checkpointing."""
 
-    def __init__(self, mod: nn.Module, ckpt_cfg: CheckpointCfg, name: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        mod: nn.Module,
+        ckpt_cfg: CheckpointCfg,
+        name: Optional[str] = None,
+        telemetry: Optional[TelemetryCfg] = None,
+    ) -> None:
         super().__init__()
         self.mod = mod
         self.use_ckpt: bool = False
@@ -97,6 +103,7 @@ class _CkptWrap(nn.Module):
         self._leaf_name = name or type(mod).__qualname__
         self._act_bytes: int = 0
         self._act_ema = EMA(beta=0.9)
+        self._forward_timer = ForwardTimer(beta=0.9, telemetry=telemetry)
         self._fp8_ready: bool = False
         self._fp8_active: bool = False
         self._fp8_recipe: Optional[Any] = None
@@ -117,6 +124,12 @@ class _CkptWrap(nn.Module):
         if self._act_ema.initialized:
             return float(self._act_ema.value)
         return float(self._act_bytes)
+
+    @property
+    def forward_ms_ema(self) -> Optional[float]:
+        if self._forward_timer.ema.initialized:
+            return float(self._forward_timer.ema.value)
+        return None
 
     def set_fp8_support(self, recipe: Optional[Any]) -> None:
         self._fp8_ready = recipe is not None
@@ -140,10 +153,14 @@ class _CkptWrap(nn.Module):
             enabled=self._autocast_enabled,
         )
         with ctx, amp_ctx:
-            if self.use_ckpt:
-                out = self._checkpoint_call(*args, **kwargs)
-            else:
-                out = self.mod(*args, **kwargs)
+            self._forward_timer.start()
+            try:
+                if self.use_ckpt:
+                    out = self._checkpoint_call(*args, **kwargs)
+                else:
+                    out = self.mod(*args, **kwargs)
+            finally:
+                self._forward_timer.stop_update()
         self._act_bytes = tensor_bytes(out)
         self._act_ema.update(float(self._act_bytes))
         return out
@@ -187,12 +204,21 @@ def _is_leaf(m: nn.Module) -> bool:
     return (len(list(m.children())) == 0) or isinstance(m, _LEAF_TYPES)
 
 
-def _wrap_leaves(model: nn.Module, ckpt_cfg: CheckpointCfg) -> Tuple[nn.Module, List[_CkptWrap]]:
+def _wrap_leaves(
+    model: nn.Module,
+    ckpt_cfg: CheckpointCfg,
+    telemetry_cfg: Optional[TelemetryCfg],
+) -> Tuple[nn.Module, List[_CkptWrap]]:
     wrappers: List[_CkptWrap] = []
 
     def _wrap(module: nn.Module, prefix: str) -> nn.Module:
         if _is_leaf(module):
-            w = _CkptWrap(module, ckpt_cfg, prefix or type(module).__qualname__)
+            w = _CkptWrap(
+                module,
+                ckpt_cfg,
+                prefix or type(module).__qualname__,
+                telemetry=telemetry_cfg,
+            )
             wrappers.append(w)
             return w
         for name, child in list(module.named_children()):
@@ -320,12 +346,24 @@ class DPCS:
             return PrecisionCfg(**dict(value))
         raise TypeError("precision_cfg must be a PrecisionCfg, mapping, or None")
 
+    @staticmethod
+    def _normalize_telemetry_cfg(value: Any) -> TelemetryCfg:
+        if value is None:
+            return TelemetryCfg()
+        if isinstance(value, TelemetryCfg):
+            return value
+        if isinstance(value, Mapping):
+            return TelemetryCfg(**dict(value))
+        raise TypeError("telemetry_cfg must be a TelemetryCfg, mapping, or None")
+
     def __init__(self, **kwargs: Any) -> None:
         ckpt_cfg_in = kwargs.pop("checkpoint_cfg", None)
         prec_cfg_in = kwargs.pop("precision_cfg", None)
+        telemetry_cfg_in = kwargs.pop("telemetry_cfg", None)
         self.cfg = DPCSConfig.from_kwargs(**kwargs)
         self._ckpt_cfg = self._normalize_checkpoint_cfg(ckpt_cfg_in)
         self._prec_cfg = self._normalize_precision_cfg(prec_cfg_in)
+        self._telemetry_cfg = self._normalize_telemetry_cfg(telemetry_cfg_in)
         self._step = 0
 
         self._precision_enabled = bool(self.cfg.enable_precision)
@@ -414,7 +452,7 @@ class DPCS:
     # ------------------------------ API ------------------------------------
 
     def wrap(self, model: nn.Module) -> nn.Module:
-        model, leaves = _wrap_leaves(model, self._ckpt_cfg)
+        model, leaves = _wrap_leaves(model, self._ckpt_cfg, self._telemetry_cfg)
         self._model = model
         self._leaves = leaves
         self._leaf_names = [w.leaf_name for w in leaves]
@@ -969,7 +1007,8 @@ class DPCS:
                     w.use_ckpt = False
             elif self._ckpt_on:
                 act = [w.activation_bytes_ema for w in self._leaves]
-                enable_ids = self._ckpt_pol.plan(act, hr, device_free, peak_b)
+                forward_ms = [w.forward_ms_ema for w in self._leaves]
+                enable_ids = self._ckpt_pol.plan(act, hr, device_free, peak_b, forward_ms=forward_ms)
                 self._ckpt_selected = set(enable_ids)
                 for i, w in enumerate(self._leaves):
                     w.use_ckpt = (i in self._ckpt_selected)
