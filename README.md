@@ -192,3 +192,15 @@ pytest
 Some checks (for example `tests/test_fp8_precision.py`) require a CUDA-capable
 GPU and optional dependencies such as `transformer-engine`. Use pytest markers
 (e.g. `-k 'not fp8'`) if you need to skip those GPU-specific paths.
+
+### Benchmark (static AMP + checkpointing)
+Run the short DPCS micro-benchmark (defaults to 10 steps, GPU optional):
+
+```bash
+python bench/bench_static_dpcs.py
+```
+
+The script prints a JSON summary with:
+* `steps_per_sec` for throughput (higher is better).
+* `peak_memory_bytes` for peak allocator usage (0 on CPU).
+* `overflow_count` for AMP overflow events (0 indicates stable scaling).
