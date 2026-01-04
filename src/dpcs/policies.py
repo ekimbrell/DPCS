@@ -279,6 +279,7 @@ class CheckpointPolicy:
         headroom: Optional[float],
         free_bytes: Optional[int],
         peak_bytes: Optional[int],
+        forward_ms: Optional[List[Optional[float]]] = None,
     ) -> Set[int]:
         n = len(act_bytes)
         if n == 0:
@@ -296,7 +297,18 @@ class CheckpointPolicy:
             self._last_target = set()
             return self._last_target
 
+        # Score aligns with cfg.ckpt_use_benefit_score:
+        # 0 => bytes, 1 => bytes per forward-ms (benefit).
         scores = [float(b) for b in act_bytes]
+        if int(self.cfg.ckpt_use_benefit_score) == 1 and forward_ms is not None:
+            if len(forward_ms) == len(act_bytes):
+                scores = []
+                for b, fwd in zip(act_bytes, forward_ms):
+                    denom = 0.0 if fwd is None else float(fwd)
+                    if denom <= 0.0:
+                        scores.append(float(b))
+                    else:
+                        scores.append(float(b) / denom)
 
         min_bytes = int(self.cfg.min_activation_bytes_to_ckpt)
         candidates = [
